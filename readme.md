@@ -34,7 +34,8 @@ Limites connues :
 - la comparaison est en temps constant, mais la longueur du jeton peut fuiter ;
 - pas de limitation de tentatives par IP, pas de délai dédié pour les connexions non authentifiées (fermeture au premier échec ou à la première commande non-AUTH) ;
 - le jeton transite en clair : **ce n'est pas un substitut à TLS** ; sur un réseau non fiable, utiliser un proxy TLS ;
-- le coût CPU/job de l'authentification n'a pas encore été mesuré (une vérification par connexion, pas par commande, à confirmer par benchmark).
+- coût mesuré (Docker Desktop, Zero-Dispatch, 4 shards, Memory, 8×8, 50 k jobs/s, 300 k jobs, 3 passes entrelacées) : CPU/job 26,7–29,7 µs sans AUTH contre 27,0–28,8 µs avec AUTH (plages qui se recouvrent, pas de différence mesurable) ; p99 3,4–3,6 ms dans les deux cas. Connexion courte (médianes de 200, classique / Reactor / direct) : connect 38–40 µs, AUTH 20,6–21,0 ms, premier Ping ensuite 93–226 µs. Les ≈ 21 ms sont la latence d'acceptation, pas l'AUTH : la boucle d'acceptation dort `ACCEPT_POLL` = 20 ms (`net.rs`) ; elle pénalise la première requête de toute nouvelle connexion, avec ou sans AUTH. Saturation non mesurée avec AUTH ;
+- un `AUTH` valide et des commandes envoyés dans le même paquet sont traités dans l'ordre ; une commande avant un AUTH valide n'est jamais exécutée (test `tests/auth.rs`).
 
 ## Benchmark (phase 5)
 
