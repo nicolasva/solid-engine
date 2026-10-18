@@ -297,3 +297,67 @@ Avec WAL (2 shards, 8×8, 3 passes entrelacées) :
 | Strict | 29–37 → 23–30 µs | 24,1–24,7 k → 24,9–25,6 k/s |
 
 Balanced : gain de CPU d'environ 10 %, débit saturé +25 à 30 %. Strict : le `fsync` de la VM plafonne le débit à ≈ 25 k jobs/s, donc 50 k n'est jamais atteint (21–24 k réels) et les CPU/job ne sont pas comparables à charge égale ; le gain de débit (2 à 5 %) est faible. Le `fsync` Docker Desktop n'est pas représentatif d'un disque natif ; 4 shards en WAL non mesurés.
+
+#### Mémoire (RSS) sous charge
+
+Campagne : 50 k jobs/s, 8×8, 4 shards, 3 passes entrelacées, RSS du serveur relevé **une seule fois en fin d'exécution** (`ps`), VM Docker Desktop.
+
+| Jobs | Redis Lua | SolidEngine classique (R=0) | SolidEngine direct |
+|---|---|---|---|
+| 300 000 | 16,4 Mo | 109–110 Mo | 102–107 Mo |
+| 1 000 000 | 16,1–16,2 Mo | 354–360 Mo | 354–358 Mo |
+
+SolidEngine croît linéairement avec le nombre de jobs traités (≈ 350 octets/job), Redis reste plat ; le mode direct ne change pas l'empreinte. Les ≈ 28 Mo cités plus haut ne valaient que pour un petit nombre de jobs.
+
+Cause : la rétention des jobs terminés (`jobs.completed_retention_ms`, 60 s par défaut) est plus longue que la durée du run (≈ 20 s), donc rien n'est purgé. Test (direct, 1 M de jobs, 3 passes, variable de banc `BENCH_RETENTION_MS`) :
+
+| Rétention | RSS |
+|---|---|
+| 60 s (défaut) | 348–358 Mo |
+| 1 s | 62–63 Mo |
+
+L'empreinte en régime permanent est donc bornée par débit × rétention × ≈ 350 octets, ce qui est un réglage et non une fuite. Même avec 1 s, SolidEngine reste à ≈ 62 Mo contre ≈ 16 Mo pour Redis : la mémoire n'est **pas** un avantage de SolidEngine. Le Redis Lua du banc supprime les jobs terminés, sans leases ni retries.
+
+Réserves : pas de RSS initial ni de pic (une seule mesure en fin de run) ; les ≈ 62 Mo restants (base, buffers, fragmentation, jobs en vol) ne sont pas décomposés ; 50 k jobs/s uniquement ; un seul payload. Prochaine étape : échantillonner le RSS pendant l'exécution et décomposer la mémoire de base.
+
+##### Mémoire : tas de leases périmées (corrigé)
+
+Diagnostic (`SOLID_ENGINE_MEM_STATS=1`, classique, 1 M de jobs, rétention 1 s) : le tas de leases contenait une entrée par job jamais retirée à l'ACK (suppression paresseuse), donc ≈ 250 k entrées par shard jusqu'à l'expiration du bail (30 s), soit ≈ 45 Mo. Correctif dans `shard.rs` : compaction amortie du tas quand il dépasse 2× sa taille après la dernière compaction (+ 4096). Tests du cœur et suite d'intégration verts en classique et en direct.
+
+RSS après 1 M de jobs (50 k jobs/s, 8×8, 4 shards, 3 passes) :
+
+| Rétention | Avant (R=0 / direct) | Après (R=0 / direct) | Redis Lua |
+|---|---|---|---|
+| 1 s | ≈ 67 / ≈ 62 Mo | 25,3–25,7 / 22,8–23,0 Mo | ≈ 16 Mo |
+| 60 s (défaut) | ≈ 354–366 / ≈ 354 Mo | ≈ 303 / ≈ 300 Mo | ≈ 16 Mo |
+
+Reste : avec la rétention par défaut, ≈ 300 octets par job terminé (entrée `Job` de 128 octets avec sa clé, jeu de la table de hachage, entrée du tas de rétention de 32 octets). Redis supprime les jobs à l'ACK ; SolidEngine les garde pour la déduplication et `GetJob`. Pistes non réalisées : table compacte pour les jobs terminaux. Le CPU/job n'a pas été comparé en passes entrelacées avant/après (valeurs à 50 k : R=0 31–32 µs, direct 23–27 µs, dans la fourchette précédente).
+
+##### Mémoire : table compacte des jobs terminés
+
+Un job terminal quitte la table des jobs actifs (`Job`, 128 octets + clé) pour une table `Done` (48 octets utiles : canal, état, priorité, tentatives, fencing, dates, longueur du payload ; sans payload, bail ni réservation). Déduplication, `get`, `cancel`, limite de jobs par shard et validation des réservations lisent les deux tables ; le format de snapshot est inchangé. Seul écart observable : `lease_deadline` vaut 0 dans `GetJob` d'un job terminé. Tests du cœur et suite d'intégration verts en classique et en direct.
+
+RSS (50 k jobs/s, 8×8, 4 shards, 3 passes entrelacées, une mesure en fin de run) :
+
+| Jobs / rétention | Avant (R=0 / direct) | Après (R=0 / direct) | Redis Lua |
+|---|---|---|---|
+| 300 k / 60 s (défaut) | ≈ 108 / ≈ 104 Mo | 57,7–58,4 / 54,6–55,9 Mo | 16,4 Mo |
+| 1 M / 60 s (défaut) | ≈ 303 / ≈ 300 Mo | 175,4–175,6 / 172,5–172,6 Mo | 16,1 Mo |
+| 1 M / 1 s | 25,3–25,7 / 22,8–23,0 Mo | 17,2–17,6 / 14,7–15,0 Mo | 16,1 Mo |
+
+Débit tenu à 50 k jobs/s partout ; CPU/job à 50 k : R=0 31,6–32,0 µs, direct 22,7–25,9 µs (fourchette inchangée ; pas de passes avant/après entrelacées pour ce point).
+
+Lecture : avec 1 s de rétention, le mode direct (14,7–15,0 Mo) passe sous Redis Lua (≈ 16 Mo), mais Redis supprime les jobs à l'ACK et ne garde ni déduplication ni `GetJob` après terminaison : comparaison non équivalente. Avec la rétention par défaut (60 s), SolidEngine reste à ≈ 172 Mo après 1 M de jobs (≈ 11× Redis) ; ≈ 170 octets par job retenu (entrée `Done` + jeu de la table de hachage + tas de rétention de 32 octets). Pistes non faites : purge par roue temporelle (supprime le tas), table à adressage ouvert plus dense, rétention par défaut plus courte. RSS mesuré une seule fois en fin de run, VM Docker Desktop.
+
+##### Mémoire : rétention par tranches (au lieu d'un tas)
+
+Le tas de rétention (32 octets par job) est remplacé par des tranches de 128 ms (`BTreeMap<tranche, VecDeque<id>>`, 16 octets par job) ; la date de purge exacte est stockée dans `Done` (sans coût de taille : elle tient dans le padding). Un job n'est jamais purgé avant son échéance ; avec des échéances hors ordre dans une même tranche, la purge peut être retardée d'au plus une tranche. Snapshot et WAL inchangés ; nouveau test d'expiration exacte après restauration ; 15 suites vertes en classique et en direct.
+
+RSS direct (50 k jobs/s, 8×8, 4 shards, rétention 60 s, 3 passes) :
+
+| Jobs | Avant | Après | Redis Lua |
+|---|---|---|---|
+| 300 k | 54,6–55,9 Mo | 43,1–43,3 Mo | 16,4 Mo |
+| 1 M | 172,5–172,6 Mo | 155,5–157,4 Mo | 16,1 Mo |
+
+Gain ≈ −9 % à 1 M de jobs (≈ 157 octets par job retenu) : bien inférieur à une disparition des 172 Mo, la table `Done` et ses jeux de capacité restant. Débit tenu à 50 k jobs/s ; p99 ≈ 3,5 ms inchangé ; CPU/job 23,6–28,8 µs (contre 22,7–25,9 avant) : écart possiblement du bruit, non tranché sans passes avant/après entrelacées. SolidEngine reste ≈ 10× Redis avec la rétention par défaut. Piste suivante, seulement si on poursuit : table à adressage ouvert pour `Done`.

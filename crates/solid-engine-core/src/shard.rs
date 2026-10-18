@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
 use std::sync::Arc;
 
 const STATES: usize = 6;
+const RETENTION_SLOT_SHIFT: u32 = 7;
 const RESERVATION_MASK: u64 = (1 << 48) - 1;
 
 struct Job {
@@ -22,17 +23,31 @@ struct Job {
     created_at: u64,
     /// Invalide les entrées périmées des files et des heaps (suppression paresseuse).
     seq: u64,
-    /// Date de purge des jobs terminaux (rétention).
-    purge_at: u64,
     /// Longueur d'origine, conservée après la libération du payload d'un job terminal.
     payload_len: u32,
     payload: Vec<u8>,
+}
+
+/// Trace d'un job terminal (dédoublonnage, `get`, fencing) : sans payload, bail ni réservation.
+struct Done {
+    channel_id: u16,
+    state: JobState,
+    priority: u8,
+    attempts: u32,
+    max_attempts: u32,
+    fencing_token: u64,
+    scheduled_at: u64,
+    created_at: u64,
+    payload_len: u32,
+    purge_at: u64,
 }
 
 #[derive(Default)]
 struct Queue {
     ready: BTreeMap<u8, VecDeque<(u128, u64)>>,
 }
+
+const LEASES_COMPACT_MIN: usize = 4096;
 
 type Deadline = Reverse<(u64, u128, u64)>;
 
@@ -42,11 +57,16 @@ pub struct Shard {
     id: u16,
     cfg: Arc<Config>,
     jobs: HashMap<u128, Job>,
+    done: HashMap<u128, Done>,
     queues: HashMap<u16, Queue>,
     counts: HashMap<u16, [u64; STATES]>,
     scheduled: BinaryHeap<Deadline>,
     leases: BinaryHeap<Deadline>,
-    retention: BinaryHeap<Reverse<(u64, u128)>>,
+    /// Identifiants des jobs terminaux par tranche d'échéance (`purge_at >> RETENTION_SLOT_SHIFT`), dans l'ordre d'insertion.
+    retention: BTreeMap<u64, VecDeque<u128>>,
+    retention_len: usize,
+    /// Taille du tas de leases au-delà de laquelle on le compacte (les ACK laissent des entrées périmées).
+    leases_compact_at: usize,
     next_seq: u64,
     next_reservation: u64,
     rng: u64,
@@ -62,11 +82,14 @@ impl Shard {
             id,
             cfg,
             jobs: HashMap::new(),
+            done: HashMap::new(),
             queues: HashMap::new(),
             counts: HashMap::new(),
             scheduled: BinaryHeap::new(),
             leases: BinaryHeap::new(),
-            retention: BinaryHeap::new(),
+            retention: BTreeMap::new(),
+            retention_len: 0,
+            leases_compact_at: LEASES_COMPACT_MIN,
             next_seq: 1,
             next_reservation: 1,
             rng: 0x9E37_79B9_7F4A_7C15 ^ ((id as u64 + 1) << 32) ^ now_ms(),
@@ -112,7 +135,6 @@ impl Shard {
                     scheduled_at: *scheduled_at,
                     created_at: *created_at,
                     seq: 0,
-                    purge_at: 0,
                     payload_len: payload.len() as u32,
                     payload: payload.clone(),
                 };
@@ -188,14 +210,18 @@ impl Shard {
     /// (jobs, capacité de la table, rétention, leases, planifiés, entrées de file prêtes).
     pub fn sizes(&self) -> [usize; 6] {
         let ready = self.queues.values().map(|q| q.ready.values().map(|d| d.len()).sum::<usize>()).sum();
-        [self.jobs.len(), self.jobs.capacity(), self.retention.len(), self.leases.len(), self.scheduled.len(), ready]
+        [self.jobs.len() + self.done.len(), self.jobs.capacity() + self.done.capacity(), self.retention_len, self.leases.len(), self.scheduled.len(), ready]
     }
 
     pub fn next_deadline(&self) -> Option<u64> {
         [
             self.scheduled.peek().map(|Reverse((t, _, _))| *t),
             self.leases.peek().map(|Reverse((t, _, _))| *t),
-            self.retention.peek().map(|Reverse((t, _))| *t),
+            self.retention
+                .first_key_value()
+                .and_then(|(_, q)| q.front())
+                .and_then(|id| self.done.get(id))
+                .map(|d| d.purge_at),
         ]
         .into_iter()
         .flatten()
@@ -230,20 +256,43 @@ impl Shard {
                 self.retry_or_die(id, None, now);
             }
         }
-        while let Some(&Reverse((t, id))) = self.retention.peek() {
-            if t > now {
+        // Les tranches suivent l'ordre d'insertion : une échéance hors ordre peut retarder une purge
+        // (d'au plus une tranche), jamais l'avancer.
+        while let Some(mut slot) = self.retention.first_entry() {
+            let q = slot.get_mut();
+            while let Some(&id) = q.front() {
+                if self.done.get(&id).is_some_and(|d| d.purge_at > now) {
+                    break;
+                }
+                q.pop_front();
+                self.retention_len -= 1;
+                if let Some(d) = self.done.remove(&id) {
+                    let c = &mut self.counts.entry(d.channel_id).or_insert([0; STATES])[d.state as usize];
+                    *c = c.wrapping_add_signed(-1);
+                }
+            }
+            if !q.is_empty() {
                 break;
             }
-            self.retention.pop();
-            if self.jobs.get(&id).is_some_and(|j| j.state.is_terminal()) {
-                let j = self.jobs.remove(&id).unwrap();
-                self.bump(j.channel_id, j.state, -1);
-            }
+            slot.remove();
+        }
+        if self.leases.len() > self.leases_compact_at {
+            let jobs = &self.jobs;
+            self.leases.retain(|Reverse((t, id, fence))| {
+                jobs.get(id).is_some_and(|j| {
+                    j.state == JobState::Claimed && j.lease_deadline == *t && j.fencing_token == *fence
+                })
+            });
+            self.leases.shrink_to_fit();
+            self.leases_compact_at = 2 * self.leases.len() + LEASES_COMPACT_MIN;
         }
         // La table ne rétrécit jamais seule : on la réduit quand l'écart de capacité devient grand
         // (rare, donc le coût du rehash est amorti).
         if self.jobs.capacity() > 4 * self.jobs.len() + 1024 {
             self.jobs.shrink_to(self.jobs.len() * 2 + 1024);
+        }
+        if self.done.capacity() > 4 * self.done.len() + 1024 {
+            self.done.shrink_to(self.done.len() * 2 + 1024);
         }
     }
 
@@ -253,10 +302,10 @@ impl Shard {
             return Err(EngineError::new(ErrorCode::PayloadTooLarge, "payload exceeds max_payload_bytes"));
         }
         let id = if req.job_id == 0 { self.generate_id(now) } else { req.job_id };
-        if self.jobs.contains_key(&id) {
+        if self.jobs.contains_key(&id) || self.done.contains_key(&id) {
             return Ok(PushOutcome { job_id: id, duplicate: true });
         }
-        if self.jobs.len() >= self.cfg.limits.max_jobs_per_shard {
+        if self.jobs.len() + self.done.len() >= self.cfg.limits.max_jobs_per_shard {
             return Err(EngineError::new(ErrorCode::Overloaded, "shard job limit reached"));
         }
         let max_attempts =
@@ -329,6 +378,21 @@ impl Shard {
 
     pub fn get(&mut self, job_id: u128, now: u64) -> Result<JobView> {
         self.tick(now);
+        if let Some(d) = self.done.get(&job_id) {
+            return Ok(JobView {
+                job_id,
+                channel_id: d.channel_id,
+                state: d.state,
+                priority: d.priority,
+                attempts: d.attempts,
+                max_attempts: d.max_attempts,
+                fencing_token: d.fencing_token,
+                lease_deadline: 0,
+                scheduled_at: d.scheduled_at,
+                created_at: d.created_at,
+                payload_length: d.payload_len,
+            });
+        }
         let j = self.jobs.get(&job_id).ok_or_else(not_found)?;
         Ok(JobView {
             job_id: j.id,
@@ -347,7 +411,10 @@ impl Shard {
 
     pub fn cancel(&mut self, job_id: u128, now: u64) -> Result<()> {
         self.tick(now);
-        let state = self.jobs.get(&job_id).ok_or_else(not_found)?.state;
+        let state = match self.jobs.get(&job_id) {
+            Some(j) => j.state,
+            None => self.done.get(&job_id).ok_or_else(not_found)?.state,
+        };
         if !matches!(state, JobState::Ready | JobState::Scheduled) {
             return Err(EngineError::new(ErrorCode::InvalidState, format!("cannot cancel a {state:?} job")));
         }
@@ -379,7 +446,24 @@ impl Shard {
         let mut w = Wr::default();
         w.u64(self.next_reservation);
         w.u64(self.next_seq);
-        w.u64(self.jobs.len() as u64);
+        w.u64((self.jobs.len() + self.done.len()) as u64);
+        for (id, d) in &self.done {
+            w.u128(*id);
+            w.u16(d.channel_id);
+            w.u8(d.state as u8);
+            w.u8(d.priority);
+            w.u32(d.attempts);
+            w.u32(d.max_attempts);
+            w.u64(d.fencing_token);
+            w.u64(0);
+            w.u64(0);
+            w.u64(d.scheduled_at);
+            w.u64(d.created_at);
+            w.u64(0);
+            w.u64(d.purge_at);
+            w.u32(d.payload_len);
+            w.bytes(&[]);
+        }
         for j in self.jobs.values() {
             w.u128(j.id);
             w.u16(j.channel_id);
@@ -393,7 +477,7 @@ impl Shard {
             w.u64(j.scheduled_at);
             w.u64(j.created_at);
             w.u64(j.seq);
-            w.u64(j.purge_at);
+            w.u64(0);
             w.u32(j.payload_len);
             w.bytes(&j.payload);
         }
@@ -408,7 +492,7 @@ impl Shard {
         let n = r.u64()?;
         let mut jobs = Vec::new();
         for _ in 0..n {
-            jobs.push(Job {
+            let j = Job {
                 id: r.u128()?,
                 channel_id: r.u16()?,
                 state: crate::record::state_from(r.u8()?)?,
@@ -421,35 +505,63 @@ impl Shard {
                 scheduled_at: r.u64()?,
                 created_at: r.u64()?,
                 seq: r.u64()?,
-                purge_at: r.u64()?,
-                payload_len: r.u32()?,
-                payload: r.bytes()?,
-            });
+                payload_len: 0,
+                payload: Vec::new(),
+            };
+            let purge_at = r.u64()?;
+            let payload_len = r.u32()?;
+            let payload = r.bytes()?;
+            jobs.push((Job { payload_len, payload, ..j }, purge_at));
         }
         r.finish()?;
         // L'ordre FIFO est restauré grâce au numéro de séquence.
-        jobs.sort_by_key(|j| j.seq);
-        for j in jobs {
+        jobs.sort_by_key(|(j, _)| j.seq);
+        let mut expiring = Vec::new();
+        for (j, purge_at) in jobs {
             let (id, seq, ch, prio) = (j.id, j.seq, j.channel_id, j.priority);
+            shard.bump(ch, j.state, 1);
             match j.state {
                 JobState::Ready => {
                     shard.queues.entry(ch).or_default().ready.entry(prio).or_default().push_back((id, seq))
                 }
                 JobState::Scheduled => shard.scheduled.push(Reverse((j.scheduled_at, id, seq))),
                 JobState::Claimed => shard.leases.push(Reverse((j.lease_deadline, id, j.fencing_token))),
-                _ => shard.retention.push(Reverse((j.purge_at, id))),
+                _ => {
+                    shard.done.insert(
+                        id,
+                        Done {
+                            channel_id: ch,
+                            state: j.state,
+                            priority: prio,
+                            attempts: j.attempts,
+                            max_attempts: j.max_attempts,
+                            fencing_token: j.fencing_token,
+                            scheduled_at: j.scheduled_at,
+                            created_at: j.created_at,
+                            payload_len: j.payload_len,
+                            purge_at,
+                        },
+                    );
+                    expiring.push((purge_at, id));
+                    continue;
+                }
             }
-            shard.bump(ch, j.state, 1);
             shard.jobs.insert(id, j);
+        }
+        expiring.sort_unstable();
+        for (purge_at, id) in expiring {
+            shard.expire_at(id, purge_at);
         }
         Ok(shard)
     }
 
     fn validate(&self, r: &Reservation) -> Result<()> {
-        let j = self.jobs.get(&r.job_id).ok_or_else(not_found)?;
+        let Some(j) = self.jobs.get(&r.job_id) else {
+            return Err(if self.done.contains_key(&r.job_id) { stale() } else { not_found() });
+        };
         if j.state != JobState::Claimed || j.reservation_id != r.reservation_id || j.fencing_token != r.fencing_token
         {
-            return Err(EngineError::new(ErrorCode::StaleReservation, "reservation is no longer active"));
+            return Err(stale());
         }
         Ok(())
     }
@@ -471,12 +583,30 @@ impl Shard {
         self.commit(Record::Dead { job_id: id, at: now });
     }
 
+    fn expire_at(&mut self, id: u128, purge_at: u64) {
+        self.retention.entry(purge_at >> RETENTION_SLOT_SHIFT).or_default().push_back(id);
+        self.retention_len += 1;
+    }
+
     fn finish(&mut self, id: u128, purge_at: u64) {
-        let job = self.jobs.get_mut(&id).unwrap();
-        job.purge_at = purge_at;
-        // Le payload d'un job terminal ne sert plus : seule la trace (dédoublonnage, fencing) est conservée.
-        job.payload = Vec::new();
-        self.retention.push(Reverse((purge_at, id)));
+        // Le job terminal quitte la table des jobs actifs : seule la trace (dédoublonnage, fencing) est conservée.
+        let j = self.jobs.remove(&id).unwrap();
+        self.done.insert(
+            id,
+            Done {
+                channel_id: j.channel_id,
+                state: j.state,
+                priority: j.priority,
+                attempts: j.attempts,
+                max_attempts: j.max_attempts,
+                fencing_token: j.fencing_token,
+                scheduled_at: j.scheduled_at,
+                created_at: j.created_at,
+                payload_len: j.payload_len,
+                purge_at,
+            },
+        );
+        self.expire_at(id, purge_at);
     }
 
     /// `attempt` = nombre de tentatives déjà effectuées (>= 1).
@@ -564,6 +694,10 @@ impl Shard {
             }
         }
     }
+}
+
+fn stale() -> EngineError {
+    EngineError::new(ErrorCode::StaleReservation, "reservation is no longer active")
 }
 
 fn not_found() -> EngineError {
@@ -705,6 +839,26 @@ mod tests {
     }
 
     #[test]
+    fn restored_terminal_job_expires_at_its_exact_deadline() {
+        let mut s = shard_with(|c| c.jobs.completed_retention_ms = 1000);
+        for id in 1..=3 {
+            s.push(push(id, 0, 0), 100 * id as u64).unwrap();
+            let c = s.claim(1, 0, 100 * id as u64).unwrap().unwrap();
+            s.ack(res(&c), 100 * id as u64).unwrap();
+        }
+        let mut r = Shard::from_snapshot(0, s.cfg.clone(), &s.encode_snapshot()).unwrap();
+        for id in 1..=3u128 {
+            let due = 100 * id as u64 + 1000;
+            assert_eq!(r.get(id, due - 1).unwrap().state, JobState::Completed, "job {id} purgé trop tôt");
+            if id == 1 {
+                assert_eq!(r.get(1, due).unwrap_err().code, ErrorCode::NotFound);
+            }
+        }
+        assert_eq!(r.get(2, 1200).unwrap_err().code, ErrorCode::NotFound);
+        assert_eq!(r.get(3, 1300).unwrap_err().code, ErrorCode::NotFound);
+    }
+
+    #[test]
     fn terminal_job_keeps_payload_length_but_not_payload() {
         let mut s = shard_with(|_| {});
         s.push(push(1, 0, 0), 0).unwrap();
@@ -713,8 +867,8 @@ mod tests {
         let c = s.claim(1, 0, 0).unwrap().unwrap();
         s.ack(res(&c), 0).unwrap();
         assert_eq!(s.get(1, 1).unwrap().payload_length, len);
-        assert!(s.jobs.get(&1).unwrap().payload.is_empty());
+        assert!(s.jobs.get(&1).is_none());
         let restored = Shard::from_snapshot(0, s.cfg.clone(), &s.encode_snapshot()).unwrap();
-        assert_eq!(restored.jobs.get(&1).unwrap().payload_len, len);
+        assert_eq!(restored.done.get(&1).unwrap().payload_len, len);
     }
 }
