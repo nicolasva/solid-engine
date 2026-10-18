@@ -361,7 +361,7 @@ impl Reactor {
         }
         MEM_STATS.with(|m| {
             let (on, last) = m.get();
-            if on && last.elapsed() >= std::time::Duration::from_secs(5) {
+            if on && last.elapsed() >= crate::stats::mem_stats_interval() {
                 m.set((on, std::time::Instant::now()));
                 eprintln!("mem_report thread={:?} {:?}", std::thread::current().name(), shard.mem_report());
                 eprintln!("mem_process {}", crate::stats::process_memory());

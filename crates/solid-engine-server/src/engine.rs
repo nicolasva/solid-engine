@@ -894,7 +894,7 @@ fn shard_thread(
         if shard.take_shrink_finished() {
             crate::stats::trim_memory();
         }
-        if mem_stats && last_stats.elapsed() >= Duration::from_secs(5) {
+        if mem_stats && last_stats.elapsed() >= crate::stats::mem_stats_interval() {
             last_stats = Instant::now();
             let [jobs, cap, ret, leases, sched, ready] = shard.sizes();
             eprintln!("mem_stats shard={id} jobs={jobs} cap={cap} retention={ret} leases={leases} scheduled={sched} ready={ready}");

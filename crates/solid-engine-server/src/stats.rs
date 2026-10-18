@@ -199,11 +199,50 @@ extern "C" {
     fn malloc_trim(pad: usize) -> i32;
 }
 
-/// Rend à l'OS la mémoire libre de l'arène glibc, que `free` ne restitue pas seul après une grosse purge.
+/// Délai minimal entre deux `malloc_trim` effectifs.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const TRIM_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Intervalle des diagnostics mémoire (`SOLID_ENGINE_MEM_STATS_MS`, 5000 ms par défaut).
+pub fn mem_stats_interval() -> std::time::Duration {
+    static V: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::time::Duration::from_millis(std::env::var("SOLID_ENGINE_MEM_STATS_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(5000)))
+}
+
+pub static TRIMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static TRIM_MAX_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+static TRIM_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+static TRIM_THREAD: std::sync::OnceLock<std::thread::Thread> = std::sync::OnceLock::new();
+
+/// Demande un `malloc_trim(0)` (rend à l'OS la mémoire libre de l'arène glibc, que `free` ne restitue pas seul après une
+/// grosse purge). Non bloquant : un thread dédié, hors des shards, exécute au plus un trim par `TRIM_MIN_INTERVAL`
+/// et fusionne les demandes concurrentes. Le thread n'est pas attendu à l'arrêt.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn trim_memory() {
-    // SAFETY : appel sans pointeur, thread-safe côté glibc.
-    unsafe { malloc_trim(0) };
+    use std::sync::atomic::Ordering::*;
+    TRIM_REQUESTED.store(true, Release);
+    TRIM_THREAD
+        .get_or_init(|| {
+            std::thread::Builder::new()
+                .name("trim".into())
+                .spawn(|| loop {
+                    while !TRIM_REQUESTED.swap(false, AcqRel) {
+                        std::thread::park();
+                    }
+                    let t = std::time::Instant::now();
+                    // SAFETY : appel sans pointeur, thread-safe côté glibc.
+                    unsafe { malloc_trim(0) };
+                    TRIM_MAX_US.fetch_max(t.elapsed().as_micros() as u64, Relaxed);
+                    TRIMS.fetch_add(1, Relaxed);
+                    std::thread::sleep(TRIM_MIN_INTERVAL);
+                })
+                .expect("thread trim")
+                .thread()
+                .clone()
+        })
+        .unpark();
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
@@ -221,7 +260,8 @@ fn rss_bytes() -> usize {
 pub fn process_memory() -> String {
     // SAFETY : appel sans argument, structure renvoyée par valeur.
     let m = unsafe { mallinfo2() };
-    format!("rss_bytes={} malloc_in_use={} malloc_free_held={} malloc_arena={} malloc_mmapped={}", rss_bytes(), m.uordblks, m.fordblks, m.arena, m.hblkhd)
+    use std::sync::atomic::Ordering::Relaxed;
+    format!("rss_bytes={} malloc_in_use={} malloc_free_held={} malloc_arena={} malloc_mmapped={} trims={} trim_max_us={}", rss_bytes(), m.uordblks, m.fordblks, m.arena, m.hblkhd, TRIMS.load(Relaxed), TRIM_MAX_US.load(Relaxed))
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]

@@ -363,7 +363,13 @@ Rétrécissement : `shrink_to` ne réduit qu'une sous-table par `tick` (pour bor
 | 3 | 126,2 Mo | 17,2 Mo |
 | 4 | 129,2 Mo | 7,2 Mo |
 
-Le RSS au repos ne dérive plus (5–17 Mo, contre 38–62 Mo sans trim). Un seul `malloc_trim` par fin de réduction, hors chemin chaud. Réserve : 4 cycles, Docker Desktop ; l'arrêt du serveur pendant une réduction en attente n'est pas testé.
+Le RSS au repos ne dérive plus (5–17 Mo, contre 38–62 Mo sans trim). Un seul `malloc_trim` par fin de réduction, hors chemin chaud. Réserve : 4 cycles, Docker Desktop.
+
+**Trim coordonné** : les shards ne font plus l'appel eux-mêmes. `trim_memory()` lève un drapeau et réveille un thread dédié `trim` (hors des shards) qui exécute au plus un `malloc_trim(0)` par seconde en fusionnant les demandes. Compteurs `trims` et `trim_max_us` dans `mem_process`. Mesure (3 cycles, 4 shards) : RSS après purge 5,7 / 6,3 / 5,8 Mo, 12 trims, durée max d'un trim 7,1 ms (hors shards). `malloc_free_held` reste élevé (≈ 45 Mo) : ce sont des pages rendues à l'OS par `madvise`, absentes du RSS. Le RSS est lu par la même méthode (`/proc/self/statm`) sur le même processus serveur.
+
+**Arrêt pendant une réduction** : `tests/shutdown.rs` remplit 30 000 jobs (rétention 300 ms), demande un trim puis arrête le serveur 0, 2, 10, 50 et 200 ms après la fin de la rétention. Arrêt en 6–15 ms à chaque fois, sans blocage (borne 5 s). Limite : le test n'attend pas explicitement qu'une réduction soit en cours ; les délais choisis couvrent la fenêtre de réduction sans le prouver.
+
+**Fenêtres** : `BENCH_WINDOW_SECS=N` affiche par fenêtre le débit, p50, p99, p99.9, p99.99 et max, calculés sur les échantillons de chaque fenêtre (pas de moyenne de percentiles). La fenêtre d'un échantillon est déduite de son rang (cadence constante avec `BENCH_RATE`, approximation sinon). Pas encore : CPU/job et RSS par fenêtre, compteurs de requêtes > 5/10/20 ms, rehashs/trims par fenêtre. Fenêtres de 5 s observées : p99.99 5,6–19,5 ms, max jusqu'à 19,5 ms (écarts que les p99.9 globaux masquent).
 
 ### Linux (Docker Desktop), topologie CPU, Redis Lua et réacteur expérimental
 
