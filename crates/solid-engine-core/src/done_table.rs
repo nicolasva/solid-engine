@@ -10,6 +10,8 @@ pub struct TableStats {
     pub rehash_max_us: u64,
     pub rehash_total_us: u64,
     pub max_probe: u32,
+    pub shrinks: u64,
+    pub shrink_max_us: u64,
 }
 
 #[cfg(not(feature = "dense-done"))]
@@ -51,8 +53,9 @@ mod std_table {
         pub fn iter(&self) -> impl Iterator<Item = (Id, &Done)> {
             self.0.iter().map(|(k, v)| (*k, v))
         }
-        pub fn shrink_to(&mut self, n: usize) {
-            self.0.shrink_to(n)
+        pub fn shrink_to(&mut self, n: usize) -> bool {
+            self.0.shrink_to(n);
+            false
         }
         pub fn stats(&self) -> TableStats {
             TableStats::default()
@@ -157,16 +160,14 @@ mod dense {
             self.slots[i] = s;
         }
 
-        fn rebuild(&mut self, n: usize, stats: &mut TableStats) {
+        /// Renvoie la durée en µs ; l'appelant décide à quelle statistique (croissance ou réduction) l'attribuer.
+        fn rebuild(&mut self, n: usize, max_probe: &mut u32) -> u64 {
             let started = std::time::Instant::now();
             let old = std::mem::replace(&mut self.slots, vec![EMPTY; n]);
             for s in old.into_iter().filter(|s| !is_zero(&s.key)) {
-                self.place(s, &mut stats.max_probe);
+                self.place(s, max_probe);
             }
-            let us = started.elapsed().as_micros() as u64;
-            stats.rehashes += 1;
-            stats.rehash_total_us += us;
-            stats.rehash_max_us = stats.rehash_max_us.max(us);
+            started.elapsed().as_micros() as u64
         }
     }
 
@@ -210,7 +211,10 @@ mod dense {
             }
             if (p.len + 1) * MAX_LOAD_DEN > p.slots.len() * MAX_LOAD_NUM {
                 let n = (p.slots.len() + p.slots.len() / 4).max(MIN_SLOTS);
-                p.rebuild(n, &mut self.stats);
+                let us = p.rebuild(n, &mut self.stats.max_probe);
+                self.stats.rehashes += 1;
+                self.stats.rehash_total_us += us;
+                self.stats.rehash_max_us = self.stats.rehash_max_us.max(us);
             }
             p.place(Slot { key: id, val: d }, &mut self.stats.max_probe);
             p.len += 1;
@@ -256,17 +260,23 @@ mod dense {
                 .chain(self.zero.as_ref().map(|d| (Id([0, 0]), d)))
         }
 
-        /// Réduit chaque sous-table séparément (une seule par appel à `purge`, pour borner la pause).
-        pub fn shrink_to(&mut self, n: usize) {
+        /// Réduit chaque sous-table séparément (une seule par appel, pour borner la pause).
+        /// Renvoie vrai si une sous-table a été réduite : il peut en rester d'autres.
+        pub fn shrink_to(&mut self, n: usize) -> bool {
             let per = n / PARTS;
             let want = (per * MAX_LOAD_DEN / MAX_LOAD_NUM + 1).max(MIN_SLOTS);
             for p in &mut self.parts {
                 if want < p.slots.len() && p.len < want * MAX_LOAD_NUM / MAX_LOAD_DEN {
-                    p.rebuild(want, &mut self.stats);
+                    let started = std::time::Instant::now();
+                    p.rebuild(want, &mut self.stats.max_probe);
                     p.slots.shrink_to_fit();
-                    return;
+                    let us = started.elapsed().as_micros() as u64;
+                    self.stats.shrinks += 1;
+                    self.stats.shrink_max_us = self.stats.shrink_max_us.max(us);
+                    return true;
                 }
             }
+            false
         }
     }
 
@@ -325,6 +335,21 @@ mod dense {
             }
             for (n, (k, v)) in ids.iter().enumerate() {
                 assert_eq!(t.get(k).map(|x| x.fencing_token), (n % 3 != 0).then_some(*v));
+            }
+        }
+
+        /// Les sous-tables restent équilibrées pour des identifiants séquentiels, à bits hauts constants ou à bits bas constants.
+        #[test]
+        fn parts_are_balanced_for_structured_ids() {
+            let gens: [fn(u64) -> Id; 4] = [|i| Id([i, 0]), |i| Id([i, 1]), |i| Id([i << 20, 7]), |i| Id([1 << 40, i])];
+            for g in gens {
+                let mut t = DoneTable::default();
+                for i in 1..=200_000u64 {
+                    t.insert(g(i), d(i));
+                }
+                let max = t.parts.iter().map(|p| p.len).max().unwrap();
+                let mean = 200_000 / PARTS;
+                assert!(max * 100 <= mean * 110, "max {max} mean {mean}");
             }
         }
 

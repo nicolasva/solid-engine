@@ -356,6 +356,9 @@ impl Reactor {
         let now = now_ms();
         mailbox.apply(shard, pending, failed, now);
         shard.tick(now);
+        if shard.take_shrink_finished() {
+            crate::stats::trim_memory();
+        }
         MEM_STATS.with(|m| {
             let (on, last) = m.get();
             if on && last.elapsed() >= std::time::Duration::from_secs(5) {

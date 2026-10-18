@@ -196,7 +196,18 @@ struct MallInfo2 {
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 extern "C" {
     fn mallinfo2() -> MallInfo2;
+    fn malloc_trim(pad: usize) -> i32;
 }
+
+/// Rend à l'OS la mémoire libre de l'arène glibc, que `free` ne restitue pas seul après une grosse purge.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn trim_memory() {
+    // SAFETY : appel sans pointeur, thread-safe côté glibc.
+    unsafe { malloc_trim(0) };
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn trim_memory() {}
 
 fn rss_bytes() -> usize {
     std::fs::read_to_string("/proc/self/statm")

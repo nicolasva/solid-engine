@@ -283,9 +283,9 @@ Mesure (Zero-Dispatch, 4 shards, Memory, 50 k jobs/s, 1 M de jobs, rétention 60
 
 Réserves : pas d'A/B entrelacé (l'ancien binaire n'a pas été conservé) : le CPU/job est comparé aux campagnes précédentes, variables de ±15 % ; l'économie mesurée (≈ 21,5 Mo) dépasse la projection de 15 Mo, sans explication vérifiée ; le nombre d'entrées dans `wide` sur ce banc n'a pas été relevé (attendu : 0). Contre Redis avec trace 60 s (450 Mo) : ≈ −70 %, même comparaison non équivalente qu'avant.
 
-### Table `done` dense (feature `dense-done`, activée par défaut)
+### Table `done` dense (feature `dense-done`)
 
-Table à adressage ouvert (`done_table.rs`) : sondage linéaire, suppression par décalage (sans pierres tombales), plafond de remplissage 3/4, croissance ×1,25 (remplissage 60–75 % contre ≈ 54 % en moyenne pour hashbrown), réduction de plage sans modulo. La clé nulle marque un emplacement libre ; l'identifiant 0 est stocké à part. Repli à la compilation : `cargo build --release -p solid-engine-server --no-default-features` (`HashMap` standard). Il n'existe pas de bascule au démarrage.
+Table à adressage ouvert (`done_table.rs`) : sondage linéaire, suppression par décalage (sans pierres tombales), plafond de remplissage 3/4, croissance ×1,25 (remplissage 60–75 % contre ≈ 54 % en moyenne pour hashbrown), réduction de plage sans modulo. La clé nulle marque un emplacement libre ; l'identifiant 0 est stocké à part. Elle n'est plus le défaut depuis `split-done` (voir plus bas) ; `--no-default-features` donne le `HashMap` standard. Il n'existe pas de bascule au démarrage.
 
 Tests : comparaison avec `HashMap` sous 200 000 insertions/suppressions sur 3 000 clés (grappes, enroulements), identifiant 0 et réduction ; les 16 suites passent avec la feature dans les trois modes.
 
@@ -313,6 +313,45 @@ Réserves : une pause de rehash allant jusqu'à ≈ 11 ms bloque le shard concer
 Churn prolongé (dense, direct, 4 shards, 50 k jobs/s, rétention 60 s, 20 M de jobs ≈ 6,7 min, ≈ 750 000 jobs retenus par shard en régime établi) : débit 49 990 jobs/s ; p50 182 µs, p99 3,58 ms, p99.9 4,6 ms ; CPU/job ≈ 25 µs. RSS : 109 Mo à 20 s, 325 Mo à ≈ 60 s, puis plateau à 326–331 Mo (+6 Mo sur 5 min, `malloc_free_held` qui monte de 4 à 9 Mo) ; aucun rehash après stabilisation (44 → 45, pas d'oscillation de la capacité : 870 133 pour 750 000 entrées). Pause de rehash maximale : 31–35 ms au franchissement de ≈ 700 k entrées par shard (contre 1–3 ms à 250 k) : elle croît à peu près linéairement avec la taille. Longueur de sondage maximale : 132 → 163–234 sur 5 min.
 
 Limites : seulement ≈ 7 min, pas 2 h ; pas de latences par fenêtre de 30 s (le banc n'agrège qu'en fin de run) ; pas de profil de charge variable ; pause de rehash de hashbrown à cette taille non mesurée. Une pause de ≈ 35 ms suspend un shard (≈ 400 requêtes en attente à 12,5 k jobs/s) : invisible au p99.9, probablement visible au p99.99. Si cela compte, pistes : rehash incrémental, ou abaisser le plafond à 70 %.
+
+#### Variante `split-done` (activée par défaut)
+
+La table est répartie en 64 sous-tables indépendantes (partition par le hash, position par le hash tourné) : un rehash ne déplace qu'une sous-table. Pas de migration progressive ni de double recherche. Repli à la compilation : `--no-default-features --features dense-done` (table dense non partitionnée) ou `--no-default-features` (`HashMap`).
+
+| | dense | split-64 |
+|---|---|---|
+| Pause de rehash max, 1 M de jobs (3 passes) | 2,8–8,2 ms | 0,22–0,76 ms |
+| Pause de rehash max, churn 20 M (≈ 750 000 entrées/shard) | 31–35 ms | 0,6–0,75 ms |
+| Rehashs par shard (1 M / 20 M) | 40 / 45 | 1 344 / 1 664 |
+| Temps cumulé de rehash par shard, 20 M | ≈ 35 ms (1 M : 8–37 ms) | ≈ 110 ms |
+| RSS, 1 M de jobs | 103–105 Mo | 114–116 Mo (+10 %) |
+| RSS, churn 20 M, plateau | 326–331 Mo | 298–314 Mo |
+| CPU/job, 1 M | 18,6–21,4 µs | 20,9–21,2 µs |
+| p99.9, 1 M | 4,8–5,0 ms | 4,55–4,78 ms |
+| p50 / p99 / p99.9, churn 20 M | 182 µs / 3,58 ms / 4,6 ms | 162 µs / 3,59 ms / 4,62 ms |
+
+Le surcoût mémoire de 10 % à 1 M de jobs ne se retrouve pas à 750 000 entrées par shard (hypothèse : arrondi des tailles de sous-tables à croissance ×1,25, non vérifiée par un relevé séparé). Le travail total de rehash est ≈ 3× plus élevé mais étalé en 1 600 petites pauses. Le p99.99 d'insertion se dégrade au niveau unitaire (7,9 → 38,8 µs : les 1 346 petits rehashs pèsent plus de 0,01 % des insertions). Longueur de sondage maximale : 160–203, comme en dense. Tests : équilibre des sous-tables pour identifiants séquentiels ou à bits constants (écart max ≤ 10 %), comparaison avec `HashMap`, 16 suites vertes dans les trois modes avec la feature.
+
+Vérification du binaire par défaut (4 passes entrelacées, 1 M de jobs, dense non partitionné / split-64) : débit 49 980–49 989 jobs/s ; p50 147–199 / 156–194 µs ; p99.9 4,62–4,65 / 4,54–4,58 ms ; RSS 103–105 / 113–115 Mo ; CPU/job 23–27 / 23–26 µs. Le p50 de 290 µs et le p99.9 de 5,05 ms vus sur un run isolé n'étaient pas reproduits (bruit).
+
+Rétrécissement : `shrink_to` ne réduit qu'une sous-table par `tick` (pour borner la pause) ; le shard n'ayant plus d'échéance après la dernière purge, `next_deadline` renvoie `dernier tick + 1 ms` tant qu'une réduction est en attente, sinon les sous-tables restantes seraient restées grandes jusqu'à la prochaine activité (défaut trouvé en préparant l'activation par défaut). Test `done_table_shrinks_completely_after_large_purge` : 100 000 jobs purgés, capacité finale ≤ 4 096. La durée d'une réduction n'est pas mesurée séparément (c'est un rehash d'une sous-table, de l'ordre des pauses de rehash mesurées) ; RSS rendu à l'OS non mesuré après purge ; un seul run de 20 M par variante ; pas de latences par fenêtre ni de p99.99 bout à bout.
+
+#### Mémoire après purge (split-done, 3 cycles dans le même processus)
+
+`BENCH_PURGE_CYCLES=3 BENCH_PURGE_WAIT=75` : 1 M de jobs à 50 k/s, puis 75 s sans aucune commande (rétention 60 s), trois fois dans le même serveur (direct, 4 shards). Démarrage : RSS 35 Mo.
+
+| Cycle | RSS après remplissage | RSS après 75 s sans commande | Mémoire allouée (`malloc_in_use`) après purge | Libre retenu par glibc |
+|---|---|---|---|---|
+| 1 | 115,7 Mo | 37,8 Mo | 2 Mo | 33 Mo |
+| 2 | 123,8 Mo | 62,1 Mo | 2 Mo | 57 Mo |
+| 3 | 126,1 Mo | 59,8 Mo | n.r. | n.r. |
+
+- La table `done` revient à 0 entrée et à sa capacité minimale (3 072 emplacements par shard, 229 Ko) sans aucune activité, dans chaque cycle : le correctif de `next_deadline` fonctionne bout à bout.
+- La mémoire allouée est identique d'un cycle à l'autre (≈ 96 Mo en fin de remplissage, 31 + 65 Mo mmappés au cycle 1, 96 Mo dans l'arène au cycle 2) : pas d'accumulation de la part du moteur.
+- Le RSS, lui, dérive : +8 Mo (cycle 2) puis +2,3 Mo (cycle 3) en fin de remplissage ; 38 → 62 → 60 Mo au repos. Cause visible dans `mallinfo2` : au cycle 2 glibc a relevé son seuil de mmap, les tables vont dans l'arène et 25 puis 57 Mo y restent libres mais non rendus à l'OS. C'est le comportement de l'allocateur, pas du moteur ; seulement 3 cycles, la stabilisation n'est pas démontrée.
+- Réduction des sous-tables : 2 600 à 5 300 réductions par shard et par cycle (la réduction progresse par paliers pendant l'expiration) ; pause maximale d'une réduction 0,3–2,6 ms.
+- Pistes (non implémentées) : `malloc_trim(0)` à la fin d'une réduction, ou fixer le seuil de mmap.
+- Non vérifié : l'arrêt du serveur pendant une réduction en attente.
 
 ### Linux (Docker Desktop), topologie CPU, Redis Lua et réacteur expérimental
 

@@ -891,6 +891,9 @@ fn shard_thread(
     loop {
         let now = now_ms();
         shard.tick(now);
+        if shard.take_shrink_finished() {
+            crate::stats::trim_memory();
+        }
         if mem_stats && last_stats.elapsed() >= Duration::from_secs(5) {
             last_stats = Instant::now();
             let [jobs, cap, ret, leases, sched, ready] = shard.sizes();

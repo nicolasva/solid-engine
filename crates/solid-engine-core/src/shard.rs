@@ -118,6 +118,8 @@ pub struct MemReport {
     pub done_rehash_max_us: u64,
     pub done_rehash_total_us: u64,
     pub done_max_probe: u32,
+    pub done_shrinks: u64,
+    pub done_shrink_max_us: u64,
 }
 
 #[derive(Default)]
@@ -136,6 +138,9 @@ pub struct Shard {
     cfg: Arc<Config>,
     jobs: HashMap<u128, Job>,
     done: DoneTable,
+    last_tick: u64,
+    shrink_pending: bool,
+    shrink_finished: bool,
     /// Horodatages exacts des rares jobs terminés dont l'écart à `purge_at` ne tient pas dans un u32.
     wide: HashMap<Id, (u64, u64)>,
     queues: HashMap<u16, Queue>,
@@ -163,6 +168,9 @@ impl Shard {
             cfg,
             jobs: HashMap::new(),
             done: DoneTable::default(),
+            last_tick: 0,
+            shrink_pending: false,
+            shrink_finished: false,
             wide: HashMap::new(),
             queues: HashMap::new(),
             counts: HashMap::new(),
@@ -309,6 +317,8 @@ impl Shard {
             done_rehash_max_us: self.done.stats().rehash_max_us,
             done_rehash_total_us: self.done.stats().rehash_total_us,
             done_max_probe: self.done.stats().max_probe,
+            done_shrinks: self.done.stats().shrinks,
+            done_shrink_max_us: self.done.stats().shrink_max_us,
             retention_slices: self.retention.len(),
             retention_entries: self.retention_len,
             retention_capacity: self.retention.values().map(|q| q.capacity()).sum(),
@@ -325,6 +335,8 @@ impl Shard {
                 .and_then(|(_, q)| q.front())
                 .and_then(|id| self.done.get(&Id::new(*id)))
                 .map(|d| d.purge_at),
+            // La réduction de la table `done` avance d'une sous-table par tick : il faut se réveiller pour la finir.
+            self.shrink_pending.then_some(self.last_tick + 1),
         ]
         .into_iter()
         .flatten()
@@ -337,6 +349,7 @@ impl Shard {
     }
 
     pub fn tick(&mut self, now: u64) {
+        self.last_tick = now;
         while let Some(&Reverse((t, id, seq))) = self.scheduled.peek() {
             if t > now {
                 break;
@@ -397,9 +410,14 @@ impl Shard {
         if self.jobs.capacity() > 4 * self.jobs.len() + 1024 {
             self.jobs.shrink_to(self.jobs.len() * 2 + 1024);
         }
-        if self.done.capacity() > 4 * self.done.len() + 1024 {
-            self.done.shrink_to(self.done.len() * 2 + 1024);
-        }
+        let was_pending = self.shrink_pending;
+        self.shrink_pending = self.done.capacity() > 4 * self.done.len() + 1024 && self.done.shrink_to(self.done.len() * 2 + 1024);
+        self.shrink_finished |= was_pending && !self.shrink_pending;
+    }
+
+    /// Vrai (et réinitialisé) quand la réduction de la table `done` vient de se terminer : bon moment pour rendre la mémoire libre à l'OS.
+    pub fn take_shrink_finished(&mut self) -> bool {
+        std::mem::take(&mut self.shrink_finished)
     }
 
     pub fn push(&mut self, req: PushRequest, now: u64) -> Result<PushOutcome> {
@@ -931,6 +949,34 @@ mod tests {
         s.ack(res(&c), 0).unwrap();
         assert_eq!(s.get(1, 9).unwrap().state, JobState::Completed);
         assert_eq!(s.get(1, 10).unwrap_err().code, ErrorCode::NotFound);
+    }
+
+    /// Après une grosse purge, la table `done` finit de rétrécir sans activité : `next_deadline` réveille le shard
+    /// jusqu'à ce que `tick` n'ait plus rien à réduire.
+    #[test]
+    fn done_table_shrinks_completely_after_large_purge() {
+        let mut s = shard_with(|c| c.jobs.completed_retention_ms = 1000);
+        for id in 1..=100_000u128 {
+            s.push(push(id, 0, 0), 0).unwrap();
+            let c = s.claim(1, 0, 0).unwrap().unwrap();
+            s.ack(res(&c), 0).unwrap();
+        }
+        let full = s.done.capacity();
+        assert!(full >= 100_000);
+        let mut now = 1000;
+        let mut wakes = 0;
+        s.tick(now);
+        while s.shrink_pending {
+            assert_eq!(s.next_deadline(), Some(now + 1));
+            now += 1;
+            s.tick(now);
+            wakes += 1;
+            assert!(wakes < 1000, "la réduction ne converge pas");
+        }
+        assert!(s.take_shrink_finished());
+        assert!(!s.take_shrink_finished());
+        assert_eq!(s.done.len(), 0);
+        assert!(s.done.capacity() <= 4 * 1024, "capacité résiduelle {} (avant : {full})", s.done.capacity());
     }
 
     #[test]
