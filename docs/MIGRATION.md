@@ -27,7 +27,12 @@ Common interface: `enqueue`, `schedule`, `claim`, `ack`, `nack`, `extend_lease`,
 
 ## Current scope
 
-The adapters are a standalone, tested storage backend. The existing SolidJobs runtime (Conductor, Recovery, Heartbeat, Catalog, Lua scripts) is **still Redis-only**; with `backend = :redis` nothing changes. Routing the worker loop through `engine_backend` is the remaining integration step.
+Ruby: the runtime routes through the adapters. `config.backend` selects the default
+backend and `config.channel_backends` overrides it per channel (see the SolidJobs
+README, "SolidEngine backend"). Channels on SolidEngine are served by workers inside `Conductor`
+(`config.execution_mode`: `:ractor` by default, one client per Ractor, or `:thread`); Redis channels keep the Ractor processors. `Catalog`,
+`Observations` and `IntegrityCheck` remain Redis-only. Python and Node have the client
+only; their routing layer is the remaining step.
 
 ## Conformance tests
 
@@ -38,7 +43,7 @@ SOLID_ENGINE_BIN=... PYTHONPATH=src python3 -m unittest tests.test_solid_engine_
 SOLID_ENGINE_BIN=... node --test test/solid_engine_backend.test.js                                             # solid-jobs-node
 ```
 
-## Migration (once the runtime uses the adapter)
+## Migration
 
 1. Run the engine with `durability = "strict"` or `"balanced"` and a `data_dir`.
 2. Drain Redis queues (or keep a Redis worker running on the old channels until empty).
