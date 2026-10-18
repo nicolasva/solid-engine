@@ -283,9 +283,9 @@ Mesure (Zero-Dispatch, 4 shards, Memory, 50 k jobs/s, 1 M de jobs, rétention 60
 
 Réserves : pas d'A/B entrelacé (l'ancien binaire n'a pas été conservé) : le CPU/job est comparé aux campagnes précédentes, variables de ±15 % ; l'économie mesurée (≈ 21,5 Mo) dépasse la projection de 15 Mo, sans explication vérifiée ; le nombre d'entrées dans `wide` sur ce banc n'a pas été relevé (attendu : 0). Contre Redis avec trace 60 s (450 Mo) : ≈ −70 %, même comparaison non équivalente qu'avant.
 
-### Table `done` dense (feature `dense-done`, désactivée par défaut)
+### Table `done` dense (feature `dense-done`, activée par défaut)
 
-Table à adressage ouvert (`done_table.rs`) : sondage linéaire, suppression par décalage (sans pierres tombales), plafond de remplissage 3/4, croissance ×1,25 (remplissage 60–75 % contre ≈ 54 % en moyenne pour hashbrown), réduction de plage sans modulo. La clé nulle marque un emplacement libre ; l'identifiant 0 est stocké à part. Compilation : `cargo build --release -p solid-engine-server --features dense-done`. Sans la feature, `HashMap` standard.
+Table à adressage ouvert (`done_table.rs`) : sondage linéaire, suppression par décalage (sans pierres tombales), plafond de remplissage 3/4, croissance ×1,25 (remplissage 60–75 % contre ≈ 54 % en moyenne pour hashbrown), réduction de plage sans modulo. La clé nulle marque un emplacement libre ; l'identifiant 0 est stocké à part. Repli à la compilation : `cargo build --release -p solid-engine-server --no-default-features` (`HashMap` standard). Il n'existe pas de bascule au démarrage.
 
 Tests : comparaison avec `HashMap` sous 200 000 insertions/suppressions sur 3 000 clés (grappes, enroulements), identifiant 0 et réduction ; les 16 suites passent avec la feature dans les trois modes.
 
@@ -301,6 +301,14 @@ A/B entrelacé, 4 passes, Zero-Dispatch, 4 shards, 50 k jobs/s, 1 M de jobs, ré
 Débit tenu (49 971–49 990 jobs/s) partout. Aucune différence de CPU ou de latence au-delà du bruit (±15 %) ; l'emplacement de 56 o est donc mesuré sans coût CPU contre 64 o. Gain dense : ≈ −24 % de RSS (136 → 103–106 Mo). Face à Redis avec trace 60 s (450 Mo) : ≈ −77 %.
 
 Réserves : RSS relevé en fin de run, donc dépendant du remplissage de la table à cet instant (le pic de rehash et la position par rapport au seuil de croissance varient avec le nombre de jobs) ; les pics de latence de rehash (table ×1,25, plus fréquents que ×2) ne sont visibles qu'au p99.9 et n'ont pas été mesurés ; la rétention par tranches n'a pas été comparée en A/B (ancienne version non conservée).
+
+Validation avant activation par défaut :
+- Latences d'opérations (test manuel `cargo test --release -p solid-engine-core latency -- --ignored --nocapture`, 2 M d'insertions avec fenêtre glissante de 250 000 entrées) : insertion p99.9 4,5 µs (hashbrown) contre 0,29 µs (dense) ; p99.99 10 contre 7,9 µs ; pause maximale 13,3 ms contre 3,3 ms.
+- Bout à bout, 4 passes entrelacées hashbrown 56 / dense 56 : RSS 135,8–136,2 contre 103,2–105,7 Mo ; p99.9 4,6–4,7 contre 4,6–4,8 ms ; débit tenu ; CPU/job 20–22 contre 19–23 µs (indiscernables).
+- Rehash dense (`mem_report`, par shard, 1 M de jobs) : 34 à 40 rehashs, pause maximale 1,2 à 10,9 ms, total 8 à 37 ms sur ≈ 20 s ; longueur maximale de sondage 124–171.
+- Tests : comparaison avec `HashMap` sous churn, invariant de sondage proche de 75 % après suppressions en grappe, identifiant 0 ; 16 suites vertes dans les trois modes.
+
+Réserves : une pause de rehash allant jusqu'à ≈ 11 ms bloque le shard concerné (hashbrown a des pauses du même ordre, 13 ms mesurées en test unitaire, mais non instrumentées bout à bout) ; elle n'apparaît pas au p99.9 de ce banc ; le sondage maximal de 171 est un pic isolé (p99.99 d'insertion 7,9 µs) mais montre que le remplissage de 75 % crée de longues grappes ; pas de test de churn de plusieurs heures.
 
 ### Linux (Docker Desktop), topologie CPU, Redis Lua et réacteur expérimental
 

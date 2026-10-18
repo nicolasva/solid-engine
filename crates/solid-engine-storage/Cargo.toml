@@ -5,5 +5,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-solid-engine-core = { path = "../solid-engine-core" }
+solid-engine-core = { path = "../solid-engine-core", default-features = false }
 crc32fast.workspace = true

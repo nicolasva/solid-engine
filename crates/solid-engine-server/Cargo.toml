@@ -12,10 +12,11 @@ name = "solid-engine-server"
 path = "src/bin/main.rs"
 
 [dependencies]
-solid-engine-core = { path = "../solid-engine-core" }
+solid-engine-core = { path = "../solid-engine-core", default-features = false }
 solid-engine-protocol = { path = "../solid-engine-protocol" }
 solid-engine-storage = { path = "../solid-engine-storage" }
 
 [features]
+default = ["dense-done"]
 dense-done = ["solid-engine-core/dense-done"]
 slot64 = ["solid-engine-core/slot64"]

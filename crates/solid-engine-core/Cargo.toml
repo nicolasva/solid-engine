@@ -9,5 +9,6 @@ serde.workspace = true
 toml.workspace = true
 
 [features]
+default = ["dense-done"]
 dense-done = []
 slot64 = []
