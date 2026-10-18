@@ -68,6 +68,8 @@ mod dense {
     const MAX_LOAD_NUM: usize = 3;
     const MAX_LOAD_DEN: usize = 4;
     const MIN_SLOTS: usize = 64;
+    /// Sous-tables indépendantes (feature `split-done`) : un rehash ne déplace qu'une sous-table, donc la pause est divisée d'autant.
+    const PARTS: usize = if cfg!(feature = "split-done") { 64 } else { 1 };
 
     #[derive(Clone, Copy)]
     struct Slot {
@@ -77,18 +79,23 @@ mod dense {
 
     const EMPTY: Slot = Slot { key: Id([0, 0]), val: Done::EMPTY };
 
+    #[derive(Default)]
+    struct Part {
+        slots: Vec<Slot>,
+        len: usize,
+    }
+
     /// Adressage ouvert, sondage linéaire, suppression par décalage (pas de pierres tombales).
     /// La clé nulle marque un emplacement libre : l'identifiant 0 vit dans `zero`.
     pub(crate) struct DoneTable {
-        slots: Vec<Slot>,
-        len: usize,
+        parts: Vec<Part>,
         zero: Option<Done>,
         stats: TableStats,
     }
 
     impl Default for DoneTable {
         fn default() -> Self {
-            DoneTable { slots: Vec::new(), len: 0, zero: None, stats: TableStats::default() }
+            DoneTable { parts: (0..PARTS).map(|_| Part::default()).collect(), zero: None, stats: TableStats::default() }
         }
     }
 
@@ -103,28 +110,23 @@ mod dense {
         h ^ (h >> 31)
     }
 
-    /// Réduction de plage sans modulo : monotone en `h`, donc compatible avec le décalage à la suppression.
-    fn home(id: &Id, n: usize) -> usize {
-        ((hash(id) as u128 * n as u128) >> 64) as usize
+    fn part_of(h: u64) -> usize {
+        ((h as u128 * PARTS as u128) >> 64) as usize
     }
 
-    impl DoneTable {
-        pub fn len(&self) -> usize {
-            self.len + self.zero.is_some() as usize
-        }
-        pub fn capacity(&self) -> usize {
-            self.slots.len() * MAX_LOAD_NUM / MAX_LOAD_DEN
-        }
-        pub fn table_bytes(&self) -> usize {
-            self.slots.capacity() * std::mem::size_of::<Slot>()
-        }
+    /// Réduction de plage sans modulo : monotone en `h`, donc compatible avec le décalage à la suppression.
+    /// Le hash est tourné pour que la position soit indépendante de la sous-table.
+    fn home(h: u64, n: usize) -> usize {
+        ((h.rotate_left(32) as u128 * n as u128) >> 64) as usize
+    }
 
-        fn find(&self, id: &Id) -> Option<usize> {
+    impl Part {
+        fn find(&self, id: &Id, h: u64) -> Option<usize> {
             let n = self.slots.len();
             if n == 0 {
                 return None;
             }
-            let mut i = home(id, n);
+            let mut i = home(h, n);
             loop {
                 let s = &self.slots[i];
                 if s.key == *id {
@@ -140,36 +142,9 @@ mod dense {
             }
         }
 
-        pub fn get(&self, id: &Id) -> Option<&Done> {
-            if is_zero(id) {
-                return self.zero.as_ref();
-            }
-            self.find(id).map(|i| &self.slots[i].val)
-        }
-
-        pub fn contains_key(&self, id: &Id) -> bool {
-            self.get(id).is_some()
-        }
-
-        pub fn stats(&self) -> TableStats {
-            self.stats
-        }
-
-        fn rebuild(&mut self, n: usize) {
-            let started = std::time::Instant::now();
-            let old = std::mem::replace(&mut self.slots, vec![EMPTY; n]);
-            for s in old.into_iter().filter(|s| !is_zero(&s.key)) {
-                self.place(s);
-            }
-            let us = started.elapsed().as_micros() as u64;
-            self.stats.rehashes += 1;
-            self.stats.rehash_total_us += us;
-            self.stats.rehash_max_us = self.stats.rehash_max_us.max(us);
-        }
-
-        fn place(&mut self, s: Slot) {
+        fn place(&mut self, s: Slot, max_probe: &mut u32) {
             let n = self.slots.len();
-            let mut i = home(&s.key, n);
+            let mut i = home(hash(&s.key), n);
             let mut probe = 0u32;
             while !is_zero(&self.slots[i].key) {
                 i += 1;
@@ -178,8 +153,48 @@ mod dense {
                     i = 0;
                 }
             }
-            self.stats.max_probe = self.stats.max_probe.max(probe);
+            *max_probe = (*max_probe).max(probe);
             self.slots[i] = s;
+        }
+
+        fn rebuild(&mut self, n: usize, stats: &mut TableStats) {
+            let started = std::time::Instant::now();
+            let old = std::mem::replace(&mut self.slots, vec![EMPTY; n]);
+            for s in old.into_iter().filter(|s| !is_zero(&s.key)) {
+                self.place(s, &mut stats.max_probe);
+            }
+            let us = started.elapsed().as_micros() as u64;
+            stats.rehashes += 1;
+            stats.rehash_total_us += us;
+            stats.rehash_max_us = stats.rehash_max_us.max(us);
+        }
+    }
+
+    impl DoneTable {
+        pub fn len(&self) -> usize {
+            self.parts.iter().map(|p| p.len).sum::<usize>() + self.zero.is_some() as usize
+        }
+        pub fn capacity(&self) -> usize {
+            self.parts.iter().map(|p| p.slots.len() * MAX_LOAD_NUM / MAX_LOAD_DEN).sum()
+        }
+        pub fn table_bytes(&self) -> usize {
+            self.parts.iter().map(|p| p.slots.capacity() * std::mem::size_of::<Slot>()).sum()
+        }
+        pub fn stats(&self) -> TableStats {
+            self.stats
+        }
+
+        pub fn get(&self, id: &Id) -> Option<&Done> {
+            if is_zero(id) {
+                return self.zero.as_ref();
+            }
+            let h = hash(id);
+            let p = &self.parts[part_of(h)];
+            p.find(id, h).map(|i| &p.slots[i].val)
+        }
+
+        pub fn contains_key(&self, id: &Id) -> bool {
+            self.get(id).is_some()
         }
 
         pub fn insert(&mut self, id: Id, d: Done) {
@@ -187,65 +202,75 @@ mod dense {
                 self.zero = Some(d);
                 return;
             }
-            if let Some(i) = self.find(&id) {
-                self.slots[i].val = d;
+            let h = hash(&id);
+            let p = &mut self.parts[part_of(h)];
+            if let Some(i) = p.find(&id, h) {
+                p.slots[i].val = d;
                 return;
             }
-            if (self.len + 1) * MAX_LOAD_DEN > self.slots.len() * MAX_LOAD_NUM {
-                let n = (self.slots.len() + self.slots.len() / 4).max(MIN_SLOTS);
-                self.rebuild(n);
+            if (p.len + 1) * MAX_LOAD_DEN > p.slots.len() * MAX_LOAD_NUM {
+                let n = (p.slots.len() + p.slots.len() / 4).max(MIN_SLOTS);
+                p.rebuild(n, &mut self.stats);
             }
-            self.place(Slot { key: id, val: d });
-            self.len += 1;
+            p.place(Slot { key: id, val: d }, &mut self.stats.max_probe);
+            p.len += 1;
         }
 
         pub fn remove(&mut self, id: &Id) -> Option<Done> {
             if is_zero(id) {
                 return self.zero.take();
             }
-            let mut i = self.find(id)?;
-            let removed = self.slots[i].val;
-            let n = self.slots.len();
+            let h = hash(id);
+            let p = &mut self.parts[part_of(h)];
+            let mut i = p.find(id, h)?;
+            let removed = p.slots[i].val;
+            let n = p.slots.len();
             let mut j = i;
             loop {
                 j += 1;
                 if j == n {
                     j = 0;
                 }
-                if is_zero(&self.slots[j].key) {
+                if is_zero(&p.slots[j].key) {
                     break;
                 }
-                let k = home(&self.slots[j].key, n);
+                let k = home(hash(&p.slots[j].key), n);
                 // L'entrée en `j` peut combler `i` si sa position d'origine `k` n'est pas dans ]i, j] (circulaire).
                 let movable = if i <= j { k <= i || k > j } else { k <= i && k > j };
                 if movable {
-                    self.slots[i] = self.slots[j];
+                    p.slots[i] = p.slots[j];
                     i = j;
                 }
             }
-            self.slots[i] = EMPTY;
-            self.len -= 1;
+            p.slots[i] = EMPTY;
+            p.len -= 1;
             Some(removed)
         }
 
         pub fn iter(&self) -> impl Iterator<Item = (Id, &Done)> {
-            self.slots
+            self.parts
                 .iter()
+                .flat_map(|p| p.slots.iter())
                 .filter(|s| !is_zero(&s.key))
                 .map(|s| (s.key, &s.val))
                 .chain(self.zero.as_ref().map(|d| (Id([0, 0]), d)))
         }
 
+        /// Réduit chaque sous-table séparément (une seule par appel à `purge`, pour borner la pause).
         pub fn shrink_to(&mut self, n: usize) {
-            let want = (n * MAX_LOAD_DEN / MAX_LOAD_NUM + 1).max(MIN_SLOTS);
-            if want < self.slots.len() && self.len < want * MAX_LOAD_NUM / MAX_LOAD_DEN {
-                self.rebuild(want);
-                self.slots.shrink_to_fit();
+            let per = n / PARTS;
+            let want = (per * MAX_LOAD_DEN / MAX_LOAD_NUM + 1).max(MIN_SLOTS);
+            for p in &mut self.parts {
+                if want < p.slots.len() && p.len < want * MAX_LOAD_NUM / MAX_LOAD_DEN {
+                    p.rebuild(want, &mut self.stats);
+                    p.slots.shrink_to_fit();
+                    return;
+                }
             }
         }
     }
 
-    #[cfg(test)]
+
     mod tests {
         use super::*;
         use std::collections::HashMap;
@@ -287,7 +312,7 @@ mod dense {
             let mut t = DoneTable::default();
             let mut ids = Vec::new();
             let mut i = 1u64;
-            while t.slots.len() < 4096 || t.len < t.slots.len() * 3 / 4 - 1 {
+            while t.parts[0].slots.len() < 4096 || t.parts[0].len < t.parts[0].slots.len() * 3 / 4 - 1 {
                 let k = Id([i.wrapping_mul(0x9E37_79B9_7F4A_7C15), 0]);
                 t.insert(k, d(i));
                 ids.push((k, i));
@@ -314,9 +339,11 @@ mod dense {
             for i in 1..10_000u64 {
                 t.remove(&Id([i, i])).unwrap();
             }
-            t.shrink_to(0);
+            for _ in 0..=PARTS {
+                t.shrink_to(0);
+            }
             assert_eq!(t.len(), 1);
-            assert!(t.slots.len() <= 128);
+            assert!(t.parts.iter().all(|p| p.slots.len() <= 128));
             assert_eq!(t.remove(&Id([0, 0])).unwrap().fencing_token, 7);
             assert_eq!(t.len(), 0);
         }

@@ -12,3 +12,4 @@ toml.workspace = true
 default = ["dense-done"]
 dense-done = []
 slot64 = []
+split-done = ["dense-done"]

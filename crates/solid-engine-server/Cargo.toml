@@ -20,3 +20,4 @@ solid-engine-storage = { path = "../solid-engine-storage" }
 default = ["dense-done"]
 dense-done = ["solid-engine-core/dense-done"]
 slot64 = ["solid-engine-core/slot64"]
+split-done = ["solid-engine-core/split-done"]

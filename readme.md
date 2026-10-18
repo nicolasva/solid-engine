@@ -310,6 +310,10 @@ Validation avant activation par défaut :
 
 Réserves : une pause de rehash allant jusqu'à ≈ 11 ms bloque le shard concerné (hashbrown a des pauses du même ordre, 13 ms mesurées en test unitaire, mais non instrumentées bout à bout) ; elle n'apparaît pas au p99.9 de ce banc ; le sondage maximal de 171 est un pic isolé (p99.99 d'insertion 7,9 µs) mais montre que le remplissage de 75 % crée de longues grappes ; pas de test de churn de plusieurs heures.
 
+Churn prolongé (dense, direct, 4 shards, 50 k jobs/s, rétention 60 s, 20 M de jobs ≈ 6,7 min, ≈ 750 000 jobs retenus par shard en régime établi) : débit 49 990 jobs/s ; p50 182 µs, p99 3,58 ms, p99.9 4,6 ms ; CPU/job ≈ 25 µs. RSS : 109 Mo à 20 s, 325 Mo à ≈ 60 s, puis plateau à 326–331 Mo (+6 Mo sur 5 min, `malloc_free_held` qui monte de 4 à 9 Mo) ; aucun rehash après stabilisation (44 → 45, pas d'oscillation de la capacité : 870 133 pour 750 000 entrées). Pause de rehash maximale : 31–35 ms au franchissement de ≈ 700 k entrées par shard (contre 1–3 ms à 250 k) : elle croît à peu près linéairement avec la taille. Longueur de sondage maximale : 132 → 163–234 sur 5 min.
+
+Limites : seulement ≈ 7 min, pas 2 h ; pas de latences par fenêtre de 30 s (le banc n'agrège qu'en fin de run) ; pas de profil de charge variable ; pause de rehash de hashbrown à cette taille non mesurée. Une pause de ≈ 35 ms suspend un shard (≈ 400 requêtes en attente à 12,5 k jobs/s) : invisible au p99.9, probablement visible au p99.99. Si cela compte, pistes : rehash incrémental, ou abaisser le plafond à 70 %.
+
 ### Linux (Docker Desktop), topologie CPU, Redis Lua et réacteur expérimental
 
 Environnement : conteneur `rust:1-bookworm` dans Docker Desktop (VM LinuxKit, 12 CPU partagés avec macOS), mode Memory, affinité de claim A2, générateur épinglé sur les CPU 0–5, serveur sur les CPU 6–7 (`taskset`). Médianes de 3 passes entrelacées. Le CPU est celui du processus serveur (`/proc`). Scripts : `benchmark_solid_engine/scripts/` (`pin_server.sh`, `pin_redis.sh`, `campaign_redis.sh`, `thread_cpu.py`, `perf_attach.sh`).
