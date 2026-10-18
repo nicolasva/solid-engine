@@ -264,6 +264,44 @@ Lecture : avec une trace conservée 60 s, Redis utilise ≈ 2,9× plus de RAM qu
 
 Réserves : la trace Redis (hash de 2 champs + expiration) ne reproduit pas tout `GetJob` (canal, priorité, tentatives max, fencing, horodatages) ; le nombre de clés a été vérifié sur deux passes supplémentaires, juste après la charge : `DBSIZE` = 1 000 002 (1 M de traces + 2 clés de compteurs), `used_memory` ≈ 450,1 Mo (≈ 450 o par trace), TTL d'une clé tirée au hasard = 38 et 50 s (> 0, aucune expiration prématurée) ; côté SolidEngine, `mem_report` totalise ≈ 999 800 jobs terminés retenus ; le RSS n'est mesuré qu'en fin de run ; Docker Desktop, pas de Linux natif ; Redis monothread contre 4 shards SolidEngine.
 
+### Emplacement de la table `done` : 64 → 56 octets
+
+Un `Done` faisait 48 o sans padding récupérable (4 × u64, 3 × u32, u16, 2 × u8) ; avec une clé u128 (alignement 16) l'emplacement valait 64 o. Deux changements sans perte :
+- la clé est un `[u64; 2]` (alignement 8) ;
+- `created_at` et `scheduled_at` sont stockés comme écarts u32 sous `purge_at` (`Done` = 40 o). Quand un écart dépasse `u32::MAX − 1` ms (≈ 49,7 jours) ou que l'horodatage est postérieur à `purge_at` (job planifié très tard puis annulé), les deux valeurs exactes vont dans une table annexe `wide` (libérée à la purge) : aucune perte de précision, snapshots et WAL inchangés.
+
+Tests : `done_slot_is_56_bytes`, bornes de l'écart (`u32::MAX − 1` compact, `u32::MAX` annexe), jobs hors plage exacts via `get`, snapshot/restauration et purge (14 tests du cœur, 16 suites dans les trois modes).
+
+Mesure (Zero-Dispatch, 4 shards, Memory, 50 k jobs/s, 1 M de jobs, rétention 60 s, 3 passes) : emplacement 56 o confirmé par `mem_report` (capacité de table inchangée : 458 752).
+
+| | Avant | Après |
+|---|---|---|
+| RSS | 157,3–157,5 Mo | 135,6–136,1 Mo (−13,5 %) |
+| Débit | 49 987 jobs/s | 49 987–49 993 |
+| p50 / p99 | 178–202 µs / 3,5–3,6 ms | 148–173 µs / 3,58 ms |
+| CPU/job | 25,3–28 µs | 22,4–24,1 µs |
+
+Réserves : pas d'A/B entrelacé (l'ancien binaire n'a pas été conservé) : le CPU/job est comparé aux campagnes précédentes, variables de ±15 % ; l'économie mesurée (≈ 21,5 Mo) dépasse la projection de 15 Mo, sans explication vérifiée ; le nombre d'entrées dans `wide` sur ce banc n'a pas été relevé (attendu : 0). Contre Redis avec trace 60 s (450 Mo) : ≈ −70 %, même comparaison non équivalente qu'avant.
+
+### Table `done` dense (feature `dense-done`, désactivée par défaut)
+
+Table à adressage ouvert (`done_table.rs`) : sondage linéaire, suppression par décalage (sans pierres tombales), plafond de remplissage 3/4, croissance ×1,25 (remplissage 60–75 % contre ≈ 54 % en moyenne pour hashbrown), réduction de plage sans modulo. La clé nulle marque un emplacement libre ; l'identifiant 0 est stocké à part. Compilation : `cargo build --release -p solid-engine-server --features dense-done`. Sans la feature, `HashMap` standard.
+
+Tests : comparaison avec `HashMap` sous 200 000 insertions/suppressions sur 3 000 clés (grappes, enroulements), identifiant 0 et réduction ; les 16 suites passent avec la feature dans les trois modes.
+
+A/B entrelacé, 4 passes, Zero-Dispatch, 4 shards, 50 k jobs/s, 1 M de jobs, rétention 60 s (feature `slot64` : clé alignée sur 16 → emplacement de 64 o, pour isoler l'effet de l'emplacement) :
+
+| Variante | RSS | CPU/job | p50 | p99 |
+|---|---|---|---|---|
+| hashbrown, 64 o | 157,1–157,6 Mo | 22–27 µs | 149–210 µs | 3,53–3,62 ms |
+| hashbrown, 56 o | 135,9–136,2 Mo | 22–26 µs | 148–203 µs | 3,53–3,59 ms |
+| dense, 64 o | 120,3–120,7 Mo | 22–28 µs | 158–211 µs | 3,52–3,61 ms |
+| dense, 56 o | 103,1–106,0 Mo | 22–27 µs | 156–212 µs | 3,53–3,62 ms |
+
+Débit tenu (49 971–49 990 jobs/s) partout. Aucune différence de CPU ou de latence au-delà du bruit (±15 %) ; l'emplacement de 56 o est donc mesuré sans coût CPU contre 64 o. Gain dense : ≈ −24 % de RSS (136 → 103–106 Mo). Face à Redis avec trace 60 s (450 Mo) : ≈ −77 %.
+
+Réserves : RSS relevé en fin de run, donc dépendant du remplissage de la table à cet instant (le pic de rehash et la position par rapport au seuil de croissance varient avec le nombre de jobs) ; les pics de latence de rehash (table ×1,25, plus fréquents que ×2) ne sont visibles qu'au p99.9 et n'ont pas été mesurés ; la rétention par tranches n'a pas été comparée en A/B (ancienne version non conservée).
+
 ### Linux (Docker Desktop), topologie CPU, Redis Lua et réacteur expérimental
 
 Environnement : conteneur `rust:1-bookworm` dans Docker Desktop (VM LinuxKit, 12 CPU partagés avec macOS), mode Memory, affinité de claim A2, générateur épinglé sur les CPU 0–5, serveur sur les CPU 6–7 (`taskset`). Médianes de 3 passes entrelacées. Le CPU est celui du processus serveur (`/proc`). Scripts : `benchmark_solid_engine/scripts/` (`pin_server.sh`, `pin_redis.sh`, `campaign_redis.sh`, `thread_cpu.py`, `perf_attach.sh`).

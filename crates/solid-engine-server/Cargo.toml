@@ -15,3 +15,7 @@ path = "src/bin/main.rs"
 solid-engine-core = { path = "../solid-engine-core" }
 solid-engine-protocol = { path = "../solid-engine-protocol" }
 solid-engine-storage = { path = "../solid-engine-storage" }
+
+[features]
+dense-done = ["solid-engine-core/dense-done"]
+slot64 = ["solid-engine-core/slot64"]

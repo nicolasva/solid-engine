@@ -1,4 +1,5 @@
 use crate::config::{BackoffStrategy, Config};
+use crate::done_table::DoneTable;
 use crate::record::{Rd, Record, Wr};
 use crate::*;
 use std::cmp::Reverse;
@@ -29,25 +30,42 @@ struct Job {
 }
 
 /// Trace d'un job terminal (dédoublonnage, `get`, fencing) : sans payload, bail ni réservation.
-struct Done {
-    fencing_token: u64,
-    purge_at: u64,
+#[derive(Clone, Copy)]
+pub(crate) struct Done {
+    pub(crate) fencing_token: u64,
+    pub(crate) purge_at: u64,
     /// `created_at` et `scheduled_at` stockés comme écart (ms) en dessous de `purge_at` ; `WIDE` renvoie à `Shard::wide`.
-    created_off: u32,
-    scheduled_off: u32,
-    attempts: u32,
-    max_attempts: u32,
-    payload_len: u32,
-    channel_id: u16,
-    state: JobState,
-    priority: u8,
+    pub(crate) created_off: u32,
+    pub(crate) scheduled_off: u32,
+    pub(crate) attempts: u32,
+    pub(crate) max_attempts: u32,
+    pub(crate) payload_len: u32,
+    pub(crate) channel_id: u16,
+    pub(crate) state: JobState,
+    pub(crate) priority: u8,
 }
 
 const WIDE: u32 = u32::MAX;
 
+impl Done {
+    pub(crate) const EMPTY: Done = Done {
+        fencing_token: 0,
+        purge_at: 0,
+        created_off: 0,
+        scheduled_off: 0,
+        attempts: 0,
+        max_attempts: 0,
+        payload_len: 0,
+        channel_id: 0,
+        state: JobState::Ready,
+        priority: 0,
+    };
+}
+
 /// Clé alignée sur 8 octets : un `u128` impose 16 et gonfle l'emplacement de la table `done` (56 o au lieu de 64).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct Id([u64; 2]);
+#[cfg_attr(feature = "slot64", repr(align(16)))]
+pub(crate) struct Id(pub(crate) [u64; 2]);
 
 impl Id {
     fn new(v: u128) -> Self {
@@ -96,6 +114,10 @@ pub struct MemReport {
     pub retention_entries: usize,
     pub retention_capacity: usize,
     pub retention_bytes: usize,
+    pub done_rehashes: u64,
+    pub done_rehash_max_us: u64,
+    pub done_rehash_total_us: u64,
+    pub done_max_probe: u32,
 }
 
 #[derive(Default)]
@@ -113,7 +135,7 @@ pub struct Shard {
     id: u16,
     cfg: Arc<Config>,
     jobs: HashMap<u128, Job>,
-    done: HashMap<Id, Done>,
+    done: DoneTable,
     /// Horodatages exacts des rares jobs terminés dont l'écart à `purge_at` ne tient pas dans un u32.
     wide: HashMap<Id, (u64, u64)>,
     queues: HashMap<u16, Queue>,
@@ -140,7 +162,7 @@ impl Shard {
             id,
             cfg,
             jobs: HashMap::new(),
-            done: HashMap::new(),
+            done: DoneTable::default(),
             wide: HashMap::new(),
             queues: HashMap::new(),
             counts: HashMap::new(),
@@ -282,8 +304,11 @@ impl Shard {
             done_capacity: self.done.capacity(),
             done_entry_size: std::mem::size_of::<Done>(),
             done_slot_size: slot,
-            // hashbrown : un octet de contrôle par emplacement, en plus de l'emplacement lui-même.
-            done_table_bytes: self.done.capacity() * (slot + 1),
+            done_table_bytes: self.done.table_bytes(),
+            done_rehashes: self.done.stats().rehashes,
+            done_rehash_max_us: self.done.stats().rehash_max_us,
+            done_rehash_total_us: self.done.stats().rehash_total_us,
+            done_max_probe: self.done.stats().max_probe,
             retention_slices: self.retention.len(),
             retention_entries: self.retention_len,
             retention_capacity: self.retention.values().map(|q| q.capacity()).sum(),
@@ -529,8 +554,8 @@ impl Shard {
         w.u64(self.next_reservation);
         w.u64(self.next_seq);
         w.u64((self.jobs.len() + self.done.len()) as u64);
-        for (id, d) in &self.done {
-            let (created_at, scheduled_at) = self.done_times(*id, d);
+        for (id, d) in self.done.iter() {
+            let (created_at, scheduled_at) = self.done_times(id, d);
             w.u128(id.get());
             w.u16(d.channel_id);
             w.u8(d.state as u8);

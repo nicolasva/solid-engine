@@ -1,6 +1,7 @@
 //! Types partagés et logique d'un shard de SolidEngine (sans I/O, sans threads).
 
 pub mod config;
+mod done_table;
 pub mod record;
 pub mod shard;
 

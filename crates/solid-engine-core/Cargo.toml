@@ -7,3 +7,7 @@ license.workspace = true
 [dependencies]
 serde.workspace = true
 toml.workspace = true
+
+[features]
+dense-done = []
+slot64 = []
