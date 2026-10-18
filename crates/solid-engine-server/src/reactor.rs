@@ -36,6 +36,11 @@ struct EpollEvent {
     data: u64,
 }
 
+thread_local! {
+    /// SOLID_ENGINE_MEM_STATS : diagnostic mémoire périodique (activé, dernier affichage).
+    static MEM_STATS: std::cell::Cell<(bool, std::time::Instant)> = std::cell::Cell::new((std::env::var("SOLID_ENGINE_MEM_STATS").is_ok(), std::time::Instant::now()));
+}
+
 extern "C" {
     fn epoll_create1(flags: i32) -> i32;
     fn epoll_ctl(epfd: i32, op: i32, fd: i32, ev: *mut EpollEvent) -> i32;
@@ -351,6 +356,14 @@ impl Reactor {
         let now = now_ms();
         mailbox.apply(shard, pending, failed, now);
         shard.tick(now);
+        MEM_STATS.with(|m| {
+            let (on, last) = m.get();
+            if on && last.elapsed() >= std::time::Duration::from_secs(5) {
+                m.set((on, std::time::Instant::now()));
+                eprintln!("mem_report thread={:?} {:?}", std::thread::current().name(), shard.mem_report());
+                eprintln!("mem_process {}", crate::stats::process_memory());
+            }
+        });
         if !waiters.is_empty() {
             self.serve_waiters(shard, pending, failed, waiters, now);
         }

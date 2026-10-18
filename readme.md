@@ -34,8 +34,40 @@ Limites connues :
 - la comparaison est en temps constant, mais la longueur du jeton peut fuiter ;
 - pas de limitation de tentatives par IP, pas de délai dédié pour les connexions non authentifiées (fermeture au premier échec ou à la première commande non-AUTH) ;
 - le jeton transite en clair : **ce n'est pas un substitut à TLS** ; sur un réseau non fiable, utiliser un proxy TLS ;
-- coût mesuré (Docker Desktop, Zero-Dispatch, 4 shards, Memory, 8×8, 50 k jobs/s, 300 k jobs, 3 passes entrelacées) : CPU/job 26,7–29,7 µs sans AUTH contre 27,0–28,8 µs avec AUTH (plages qui se recouvrent, pas de différence mesurable) ; p99 3,4–3,6 ms dans les deux cas. Connexion courte (médianes de 200, classique / Reactor / direct) : connect 38–40 µs, AUTH 20,6–21,0 ms, premier Ping ensuite 93–226 µs. Les ≈ 21 ms sont la latence d'acceptation, pas l'AUTH : la boucle d'acceptation dort `ACCEPT_POLL` = 20 ms (`net.rs`) ; elle pénalise la première requête de toute nouvelle connexion, avec ou sans AUTH. Saturation non mesurée avec AUTH ;
+- coût mesuré (Docker Desktop, Zero-Dispatch, 4 shards, Memory, 8×8, 50 k jobs/s, 300 k jobs, 3 passes entrelacées) : CPU/job 26,7–29,7 µs sans AUTH contre 27,0–28,8 µs avec AUTH (plages qui se recouvrent, pas de différence mesurable) ; p99 3,4–3,6 ms dans les deux cas. Connexion courte : la boucle d'acceptation dormait `ACCEPT_POLL` = 20 ms, ce qui retardait de ≈ 21 ms la première requête de toute nouvelle connexion (connect 38–40 µs, AUTH 20,6–21,0 ms, avec ou sans AUTH). Elle attend désormais avec `poll()` (réveil immédiat, vérification de l'arrêt toutes les 20 ms) : médianes de 200, classique / Reactor / direct, connect 12–13 µs, AUTH 50–84 µs, Ping 49–92 µs. Saturation non mesurée avec AUTH ;
 - un `AUTH` valide et des commandes envoyés dans le même paquet sont traités dans l'ordre ; une commande avant un AUTH valide n'est jamais exécutée (test `tests/auth.rs`).
+
+### TLS via proxy HAProxy (phase 6)
+
+SolidEngine ne chiffre pas lui-même : en réseau non fiable, placer un proxy TLS devant le port TCP, qui doit rester joignable uniquement par le proxy (localhost ou interface privée ; ne pas exposer le port clair). Le jeton `AUTH` ne protège pas contre l'écoute du réseau sans TLS.
+
+Mesure (Docker Desktop, Zero-Dispatch, 4 shards, Memory, 8×8, 50 k jobs/s, 300 k jobs, AUTH actif, 3 passes entrelacées, HAProxy 2.6, certificat RSA 2048 auto-signé, `nbthread 1`). Le banc, en clair, passe par un second HAProxy côté client (CPU 0-5) qui ouvre le TLS ; le HAProxy serveur est épinglé sur les CPU 6-7 comme le moteur. Activation : `BENCH_TLS=1`.
+
+| | Sans TLS | Avec TLS |
+|---|---|---|
+| Débit | 49 959–49 968 jobs/s | 49 960–49 977 jobs/s |
+| p50 | 152–173 µs | 741–747 µs |
+| p99 | 3,54–3,62 ms | 3,70–3,86 ms |
+| CPU moteur / job | 22,3–24,3 µs | 15,6–16,4 µs |
+| CPU HAProxy serveur / job | — | 12,3–12,5 µs |
+| CPU total serveur / job | 22,3–24,3 µs | 28,0–28,9 µs |
+| Première requête (AUTH) sur connexion neuve | 53–62 µs | 611–622 µs |
+
+Lecture : à 50 k jobs/s le débit est tenu ; TLS ajoute ≈ 6 µs de CPU serveur par job (+ 25 %) et ≈ 0,6 ms de latence médiane (deux sauts de proxy). Le moteur consomme moins de CPU derrière le proxy (≈ −7 µs/job), vraisemblablement parce que le proxy regroupe les paquets (moins d'appels système) ; non vérifié. Le coût d'une connexion neuve passe d'environ 60 µs à 0,6 ms (handshake TLS, mesuré de bout en bout avec les deux proxies).
+
+Saturation (même configuration, sans débit imposé, 400 k jobs, 3 passes entrelacées ; certificat désormais vérifié par le HAProxy client, `verify required` + `verifyhost`) :
+
+| | Débit | p50 | p99 | CPU moteur/job | CPU HAProxy serveur/job |
+|---|---|---|---|---|---|
+| Sans proxy | 165–217 k jobs/s | 173–287 µs | 1,1–1,35 ms | 9,1–11,6 µs | — |
+| HAProxy sans TLS | 99–102 k | 579–621 µs | 0,94–0,98 ms | 10,2–10,7 µs | 5,3 µs |
+| HAProxy + TLS | 89–99 k | 604–690 µs | 1,04–1,13 ms | 8,9–10,7 µs | 6,5–7,1 µs |
+
+Lecture : tout proxy (avec ou sans TLS) fait passer le plafond d'environ 165–217 k à environ 100 k jobs/s ; TLS ajoute ≈ 1–2 µs de CPU proxy par job et un débit de 0 à −12 % au-dessus du proxy simple, dans le bruit des passes. **Le plafond TLS n'est pas isolé** : le proxy serveur (un thread) partage les CPU 6-7 avec le moteur, le HAProxy client et les 8 workers partagent les CPU 0-5, et passer le HAProxy client à 4 threads n'a pas amélioré le débit (74–91 k). Une conclusion fiable sur le plafond du chiffrement demande une machine native avec des CPU dédiés au proxy.
+
+Test d'arrêt : `shutdown_returns_promptly_with_no_incoming_connection` (< 500 ms sans connexion entrante).
+
+Réserves : un HAProxy client est dans la boucle de mesure ; certificat auto-signé (vérifié par le proxy client dans la campagne de saturation, non vérifié dans la première table) ;pas de reprise de session ni de TLS 1.3 forcé ; saturation et connexions courtes à haut débit non mesurées ; aucune comparaison avec un TLS natif (rustls).
 
 ## Benchmark (phase 5)
 
@@ -196,6 +228,41 @@ Reproduction : `cargo build --release` dans `solid-engine` et `benchmark_solid_e
 - **Limite connue du moteur** : le scan multi-shards d'un claim n'est pas atomique : sous forte contention, un claim peut renvoyer « vide » alors qu'un job vient d'être poussé (le banc réessaie).
 
 Prochaines étapes : instrumenter le chemin réseau du réacteur, réduire les échanges entre threads, profiler le chemin mémoire (routage et mailboxes).
+
+### Diagnostic mémoire des jobs terminés (1 M de jobs, rétention 60 s)
+
+`SOLID_ENGINE_MEM_STATS=1` affiche toutes les 5 s, par shard, `mem_report` (entrées, capacités, taille des structures) et, pour le processus, `mem_process` (RSS, octets alloués/libres/mmappés de glibc). Mesure : Zero-Dispatch, 4 shards, Memory, 50 k jobs/s, 1 M de jobs, 1 passe, RSS final 157,3 Mo.
+
+| Poste (par shard, fin de run) | Valeur | ×4 shards |
+|---|---|---|
+| Entrées terminées | ≈ 250 000 | ≈ 1 M |
+| Capacité de la table `done` | 458 752 emplacements (54 % utilisés) | |
+| Emplacement (clé u128 + `Done` de 48 o) | 64 o | |
+| Table `done` estimée (capacité × 65 o) | 29,8 Mo | ≈ 119 Mo |
+| Rétention (157 tranches, capacité 320 512 ids × 16 o) | 5,1 Mo | ≈ 20,5 Mo |
+| Total estimé | ≈ 35 Mo | ≈ 140 Mo |
+
+Processus : RSS 164,9 Mo ; glibc : 136 Mo mmappés (les grandes tables), 22 Mo alloués dans l'arène, 5 Mo libres conservés. L'allocateur ne retient donc presque rien : les ≈ 157 Mo sont des données vivantes, pas de la fragmentation ni une fuite.
+
+Constats (mesurés) :
+- ≈ 119 o de table + ≈ 20 o de rétention par job terminé, soit ≈ 140 o sur les ≈ 157 o de RSS par job ;
+- la table est à 54 % de remplissage : la capacité d'une table de hachage double par paliers (524 288 emplacements pour 250 000 entrées, seuil de croissance à 229 376). Le RSS fait donc des paliers en fonction du nombre d'entrées retenues par shard ; un autre volume de jobs donnerait un autre rapport octets/job.
+
+Pistes (non implémentées, estimations à valider par mesure) : table à adressage ouvert avec un remplissage plus élevé et sans paliers de doublement ; réduire l'emplacement de 64 à 48 o en comprimant `Done` (horodatages relatifs en u32) ; stocker les id de rétention en u64 de hachage seulement si la déduplication reste exacte (à éviter : risque de collision). Redis Lua ne conserve pas ces entrées ; une comparaison équitable demande un scénario Redis avec une clé par job terminé (`SET job:<id> EX 60`), non fait.
+
+### Redis avec rétention de 60 s (comparaison à garanties plus proches)
+
+Jusqu'ici Redis supprimait le job à l'ACK. Variante `BENCH_REDIS_RETAIN=60` : l'ACK conserve `job:<id>` avec l'état (`s=d`) et la taille du payload (`n`), supprime le payload et la réservation, puis `EXPIRE 60`. La déduplication (`EXISTS`) reste valable pendant 60 s. Mesure : 1 M de jobs, 50 k jobs/s demandés, 8×8, Redis sur CPU 6-7, 3 passes entrelacées (Docker Desktop).
+
+| | Débit réel | p50 | p99 | RSS | CPU/job |
+|---|---|---|---|---|---|
+| Redis Lua, suppression à l'ACK | 49 984–49 987 jobs/s | 639–661 µs | 3,4–3,65 ms | 16,2 Mo | 19,6–19,7 µs |
+| Redis Lua, trace 60 s | 45 358–46 671 | 1,31–1,35 ms | 2,1–2,2 ms | 450,5 Mo | 21,4–22,1 µs |
+| SolidEngine direct, 4 shards, 60 s | 49 987 | 178–202 µs | 3,5–3,6 ms | 157,3–157,5 Mo | 25,3–28 µs |
+
+Lecture : avec une trace conservée 60 s, Redis utilise ≈ 2,9× plus de RAM que SolidEngine (450 contre 157 Mo) et ne tient pas les 50 k jobs/s demandés (45–47 k). En revanche son CPU/job est plus bas (≈ 21–22 contre 25–28 µs). Redis seul reste à 16 Mo s'il supprime à l'ACK.
+
+Réserves : la trace Redis (hash de 2 champs + expiration) ne reproduit pas tout `GetJob` (canal, priorité, tentatives max, fencing, horodatages) ; le nombre de clés a été vérifié sur deux passes supplémentaires, juste après la charge : `DBSIZE` = 1 000 002 (1 M de traces + 2 clés de compteurs), `used_memory` ≈ 450,1 Mo (≈ 450 o par trace), TTL d'une clé tirée au hasard = 38 et 50 s (> 0, aucune expiration prématurée) ; côté SolidEngine, `mem_report` totalise ≈ 999 800 jobs terminés retenus ; le RSS n'est mesuré qu'en fin de run ; Docker Desktop, pas de Linux natif ; Redis monothread contre 4 shards SolidEngine.
 
 ### Linux (Docker Desktop), topologie CPU, Redis Lua et réacteur expérimental
 

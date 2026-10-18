@@ -895,6 +895,10 @@ fn shard_thread(
             last_stats = Instant::now();
             let [jobs, cap, ret, leases, sched, ready] = shard.sizes();
             eprintln!("mem_stats shard={id} jobs={jobs} cap={cap} retention={ret} leases={leases} scheduled={sched} ready={ready}");
+            eprintln!("mem_report shard={id} {:?}", shard.mem_report());
+            if id == 0 {
+                eprintln!("mem_process {}", crate::stats::process_memory());
+            }
         }
         flush(&mut shard, &mut durable, &mut failed, &mut pending, &cfg);
         if shard.take_ready_flag() {

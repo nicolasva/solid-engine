@@ -7,13 +7,36 @@ use solid_engine_protocol::{read_frame, write_frame, Frame, ProtocolError, Reque
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::net::UnixListener;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+/// Délai maximal avant de revérifier l'arrêt ; une connexion entrante réveille l'acceptation immédiatement.
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+extern "C" {
+    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+}
+
+/// Attend une connexion entrante sur le socket d'écoute (au plus `ACCEPT_POLL`) ; sinon dort après une erreur.
+fn pause_after_accept_error(e: &std::io::Error, fd: std::os::fd::RawFd) {
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        let mut p = PollFd { fd, events: 1, revents: 0 };
+        unsafe { poll(&mut p, 1, ACCEPT_POLL.as_millis() as i32) };
+    } else {
+        std::thread::sleep(ACCEPT_POLL);
+    }
+}
 /// Marge pour l'enveloppe et les champs fixes autour du payload.
 const BODY_OVERHEAD: usize = 4096;
 
@@ -71,7 +94,7 @@ impl Server {
                                     handles[next % reactors].add(s, needs_auth);
                                     next += 1;
                                 }
-                                Err(_) => std::thread::sleep(ACCEPT_POLL),
+                                Err(e) => pause_after_accept_error(&e, listener.as_raw_fd()),
                             }
                         }
                     }));
@@ -80,7 +103,7 @@ impl Server {
                 let auth = token.clone();
                 accept_threads.push(std::thread::spawn(move || {
                     accept_loop(&e, &c, auth, || {
-                        let (s, _) = listener.accept()?;
+                        let (s, _) = listener.accept().inspect_err(|err| pause_after_accept_error(err, listener.as_raw_fd()))?;
                         s.set_nonblocking(false)?;
                         s.set_nodelay(true)?;
                         let w = s.try_clone()?;
@@ -120,7 +143,7 @@ impl Server {
                                 handles[next % reactors].add(s, false);
                                 next += 1;
                             }
-                            Err(_) => std::thread::sleep(ACCEPT_POLL),
+                            Err(e) => pause_after_accept_error(&e, listener.as_raw_fd()),
                         }
                     }
                 }));
@@ -128,7 +151,7 @@ impl Server {
             }
             accept_threads.push(std::thread::spawn(move || {
                 accept_loop(&e, &c, None, || {
-                    let (s, _) = listener.accept()?;
+                    let (s, _) = listener.accept().inspect_err(|err| pause_after_accept_error(err, listener.as_raw_fd()))?;
                     s.set_nonblocking(false)?;
                     let w = s.try_clone()?;
                     s.set_read_timeout(idle_timeout(&e))?;
@@ -194,8 +217,7 @@ fn accept_loop<R, W>(
                     c.fetch_sub(1, Ordering::SeqCst);
                 });
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(ACCEPT_POLL),
-            Err(_) => std::thread::sleep(ACCEPT_POLL),
+            Err(_) => {} // la pause est faite par la fermeture `accept`
         }
     }
 }

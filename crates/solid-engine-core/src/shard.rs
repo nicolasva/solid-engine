@@ -42,6 +42,21 @@ struct Done {
     purge_at: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MemReport {
+    pub active_jobs: usize,
+    pub active_capacity: usize,
+    pub done_entries: usize,
+    pub done_capacity: usize,
+    pub done_entry_size: usize,
+    pub done_slot_size: usize,
+    pub done_table_bytes: usize,
+    pub retention_slices: usize,
+    pub retention_entries: usize,
+    pub retention_capacity: usize,
+    pub retention_bytes: usize,
+}
+
 #[derive(Default)]
 struct Queue {
     ready: BTreeMap<u8, VecDeque<(u128, u64)>>,
@@ -211,6 +226,25 @@ impl Shard {
     pub fn sizes(&self) -> [usize; 6] {
         let ready = self.queues.values().map(|q| q.ready.values().map(|d| d.len()).sum::<usize>()).sum();
         [self.jobs.len() + self.done.len(), self.jobs.capacity() + self.done.capacity(), self.retention_len, self.leases.len(), self.scheduled.len(), ready]
+    }
+
+    /// Répartition estimée de la mémoire des jobs terminés et de la rétention (diagnostic).
+    pub fn mem_report(&self) -> MemReport {
+        let slot = std::mem::size_of::<(u128, Done)>();
+        MemReport {
+            active_jobs: self.jobs.len(),
+            active_capacity: self.jobs.capacity(),
+            done_entries: self.done.len(),
+            done_capacity: self.done.capacity(),
+            done_entry_size: std::mem::size_of::<Done>(),
+            done_slot_size: slot,
+            // hashbrown : un octet de contrôle par emplacement, en plus de l'emplacement lui-même.
+            done_table_bytes: self.done.capacity() * (slot + 1),
+            retention_slices: self.retention.len(),
+            retention_entries: self.retention_len,
+            retention_capacity: self.retention.values().map(|q| q.capacity()).sum(),
+            retention_bytes: self.retention.values().map(|q| q.capacity() * 16).sum::<usize>() + self.retention.len() * (std::mem::size_of::<VecDeque<u128>>() + 8),
+        }
     }
 
     pub fn next_deadline(&self) -> Option<u64> {

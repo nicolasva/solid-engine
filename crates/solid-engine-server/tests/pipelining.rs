@@ -109,9 +109,9 @@ fn abrupt_disconnects_with_256_in_flight_leak_nothing() {
             }
         }
         // Les requêtes déjà acceptées peuvent avoir été exécutées : le moteur reste cohérent.
-        let mut c = Client::connect_tcp(&addr).unwrap_or_else(|_| panic!("{mode:?}"));
         drop(held);
         std::thread::sleep(Duration::from_millis(100));
+        let mut c = Client::connect_tcp(&addr).unwrap_or_else(|_| panic!("{mode:?}"));
         let Response::Stats(st) = c.call(&Request::GetQueueStats { channel_id: Some(1) }).unwrap() else { panic!() };
         assert!(st.ready <= 24 * 256, "{mode:?}: {st:?}");
         server.shutdown();

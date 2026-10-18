@@ -177,3 +177,43 @@ impl<R: Read> Read for CountingReader<R> {
         Ok(n)
     }
 }
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[repr(C)]
+struct MallInfo2 {
+    arena: usize,
+    ordblks: usize,
+    smblks: usize,
+    hblks: usize,
+    hblkhd: usize,
+    usmblks: usize,
+    fsmblks: usize,
+    uordblks: usize,
+    fordblks: usize,
+    keepcost: usize,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+extern "C" {
+    fn mallinfo2() -> MallInfo2;
+}
+
+fn rss_bytes() -> usize {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<usize>().ok()))
+        .map_or(0, |pages| pages * 4096)
+}
+
+/// RSS et état de l'allocateur glibc (octets) : `in_use` = alloué, `free_held` = libéré mais conservé par l'allocateur.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn process_memory() -> String {
+    // SAFETY : appel sans argument, structure renvoyée par valeur.
+    let m = unsafe { mallinfo2() };
+    format!("rss_bytes={} malloc_in_use={} malloc_free_held={} malloc_arena={} malloc_mmapped={}", rss_bytes(), m.uordblks, m.fordblks, m.arena, m.hblkhd)
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn process_memory() -> String {
+    format!("rss_bytes={}", rss_bytes())
+}

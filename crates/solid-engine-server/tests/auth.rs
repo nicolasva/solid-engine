@@ -123,3 +123,11 @@ fn commands_pipelined_in_the_same_packet_never_run_before_a_valid_auth() {
     assert!(matches!(ok[..], [Response::Authed, Response::Push(_)]), "{ok:?}");
     server.shutdown();
 }
+
+#[test]
+fn shutdown_returns_promptly_with_no_incoming_connection() {
+    let (server, _addr) = start(|_| {});
+    let t = std::time::Instant::now();
+    server.shutdown();
+    assert!(t.elapsed() < std::time::Duration::from_millis(500), "shutdown a pris {:?}", t.elapsed());
+}
