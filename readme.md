@@ -22,6 +22,20 @@ Chaque shard possède son WAL ; en `balanced` et `strict`, un thread dédié par
 
 Une erreur d'I/O WAL met le shard en échec définitif : plus aucun succès n'est confirmé (tests : `tests/fault.rs`). En `balanced`, l'erreur est détectée de façon asynchrone, donc quelques réponses peuvent sortir avant sa détection.
 
+## Authentification TCP (phase 6)
+
+Si un jeton est configuré, toute connexion **TCP** doit envoyer `AUTH` (message 11) avant n'importe quelle commande. Une commande préalable ou un mauvais jeton renvoie `Unauthorized` (code 9) puis ferme la connexion. Un `AUTH` répété sur une connexion déjà authentifiée est accepté.
+
+Source du jeton, par priorité : variable `SOLID_ENGINE_AUTH_TOKEN`, puis `server.auth_token_file` (première ligne), puis `server.auth_token`. Aucun jeton par défaut ; un jeton vide est refusé au démarrage. Sans jeton, le comportement est inchangé. Valable en modes classique, réacteur et Zero-Dispatch (tests `tests/auth.rs`, 16 suites vertes dans les trois modes).
+
+Le socket Unix n'est pas soumis au jeton : on le protège par ses permissions (`server.unix_socket_mode`, p. ex. `0o600`).
+
+Limites connues :
+- la comparaison est en temps constant, mais la longueur du jeton peut fuiter ;
+- pas de limitation de tentatives par IP, pas de délai dédié pour les connexions non authentifiées (fermeture au premier échec ou à la première commande non-AUTH) ;
+- le jeton transite en clair : **ce n'est pas un substitut à TLS** ; sur un réseau non fiable, utiliser un proxy TLS ;
+- le coût CPU/job de l'authentification n'a pas encore été mesuré (une vérification par connexion, pas par commande, à confirmer par benchmark).
+
 ## Benchmark (phase 5)
 
 Banc : `../benchmark_solid_engine` (crate indépendante).

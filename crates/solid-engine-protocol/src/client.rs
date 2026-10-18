@@ -32,6 +32,11 @@ impl<S: Read + Write> Client<S> {
         Self { stream, next_id: 1 }
     }
 
+    /// Authentifie la connexion (obligatoire si le serveur exige un jeton sur TCP).
+    pub fn authenticate(&mut self, token: &[u8]) -> Result<Response, ProtocolError> {
+        self.call(&Request::Auth(token.to_vec()))
+    }
+
     pub fn call(&mut self, req: &Request) -> Result<Response, ProtocolError> {
         let id = self.next_id;
         self.next_id += 1;

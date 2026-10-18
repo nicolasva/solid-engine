@@ -23,6 +23,7 @@ pub mod msg {
     pub const CANCEL_JOB: u8 = 8;
     pub const WAIT_FOR_JOB: u8 = 9;
     pub const GET_QUEUE_STATS: u8 = 10;
+    pub const AUTH: u8 = 11;
     pub const RESPONSE_BIT: u8 = 0x80;
     pub const ERROR: u8 = 0xFF;
 }

@@ -27,6 +27,7 @@ pub struct Server {
 impl Server {
     pub fn start(cfg: Config) -> std::io::Result<Self> {
         let server_cfg = cfg.server.clone();
+        let token = resolve_token(&server_cfg)?;
         let direct_shards = crate::engine::direct_enabled().then_some(cfg.engine.shards);
         let engine = Engine::start(cfg).map_err(std::io::Error::other)?;
         let conns = Arc::new(AtomicUsize::new(0));
@@ -37,7 +38,7 @@ impl Server {
         let reactors = direct_shards.unwrap_or_else(reactor_count);
         #[cfg(target_os = "linux")]
         let handles = if reactors > 0 {
-            let (handles, threads) = crate::reactor::start(&engine, &conns, reactors);
+            let (handles, threads) = crate::reactor::start(&engine, &conns, reactors, token.clone());
             accept_threads.extend(threads);
             handles
         } else {
@@ -53,6 +54,7 @@ impl Server {
                 #[cfg(target_os = "linux")]
                 {
                     let handles = handles.clone();
+                    let needs_auth = token.is_some();
                     accept_threads.push(std::thread::spawn(move || {
                         let mut next = 0usize;
                         while !e.is_shutting_down() {
@@ -66,7 +68,7 @@ impl Server {
                                         c.fetch_sub(1, Ordering::SeqCst);
                                         continue;
                                     }
-                                    handles[next % reactors].add(s);
+                                    handles[next % reactors].add(s, needs_auth);
                                     next += 1;
                                 }
                                 Err(_) => std::thread::sleep(ACCEPT_POLL),
@@ -75,8 +77,9 @@ impl Server {
                     }));
                 }
             } else {
+                let auth = token.clone();
                 accept_threads.push(std::thread::spawn(move || {
-                    accept_loop(&e, &c, || {
+                    accept_loop(&e, &c, auth, || {
                         let (s, _) = listener.accept()?;
                         s.set_nonblocking(false)?;
                         s.set_nodelay(true)?;
@@ -91,6 +94,10 @@ impl Server {
         if let Some(path) = &server_cfg.unix_socket {
             let _ = std::fs::remove_file(path);
             let listener = UnixListener::bind(path)?;
+            if let Some(mode) = server_cfg.unix_socket_mode {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+            }
             listener.set_nonblocking(true)?;
             unix_path = Some(PathBuf::from(path));
             let (e, c) = (engine.clone(), conns.clone());
@@ -110,7 +117,7 @@ impl Server {
                                     c.fetch_sub(1, Ordering::SeqCst);
                                     continue;
                                 }
-                                handles[next % reactors].add(s);
+                                handles[next % reactors].add(s, false);
                                 next += 1;
                             }
                             Err(_) => std::thread::sleep(ACCEPT_POLL),
@@ -120,7 +127,7 @@ impl Server {
                 return Ok(Self { engine, tcp_addr, unix_path, accept_threads });
             }
             accept_threads.push(std::thread::spawn(move || {
-                accept_loop(&e, &c, || {
+                accept_loop(&e, &c, None, || {
                     let (s, _) = listener.accept()?;
                     s.set_nonblocking(false)?;
                     let w = s.try_clone()?;
@@ -168,6 +175,7 @@ fn idle_timeout(e: &Engine) -> Option<Duration> {
 fn accept_loop<R, W>(
     engine: &Arc<Engine>,
     conns: &Arc<AtomicUsize>,
+    auth: Option<Arc<Vec<u8>>>,
     mut accept: impl FnMut() -> std::io::Result<(R, W)>,
 ) where
     R: Read + Send + 'static,
@@ -180,9 +188,9 @@ fn accept_loop<R, W>(
                     conns.fetch_sub(1, Ordering::SeqCst);
                     continue; // fermeture immédiate : limite de connexions atteinte
                 }
-                let (e, c) = (engine.clone(), conns.clone());
+                let (e, c, a) = (engine.clone(), conns.clone(), auth.clone());
                 let _ = std::thread::Builder::new().name("se-reader".into()).spawn(move || {
-                    serve_connection(e, r, w);
+                    serve_connection(e, r, w, a);
                     c.fetch_sub(1, Ordering::SeqCst);
                 });
             }
@@ -218,7 +226,12 @@ impl InFlight {
 /// Les réponses passent par un canal et un thread d'écriture dédié par connexion : les threads
 /// du moteur (shards, writer WAL) ne touchent jamais la socket, et les réponses d'une même
 /// connexion peuvent sortir dans le désordre (corrélées par `request_id`).
-fn serve_connection<R: Read, W: Write + Send + 'static>(engine: Arc<Engine>, reader: R, mut writer: W) {
+fn serve_connection<R: Read, W: Write + Send + 'static>(
+    engine: Arc<Engine>,
+    reader: R,
+    mut writer: W,
+    auth: Option<Arc<Vec<u8>>>,
+) {
     let (out, out_rx) = std::sync::mpsc::channel::<Frame>();
     let _ = std::thread::Builder::new().name("se-writer".into()).spawn(move || {
         let mut buf = Vec::with_capacity(16 * 1024);
@@ -307,6 +320,7 @@ fn serve_connection<R: Read, W: Write + Send + 'static>(engine: Arc<Engine>, rea
     let max_body = engine.config().limits.max_payload_bytes + BODY_OVERHEAD;
     let affinity = crate::engine::claim_affinity();
     let (mut last_push_shard, mut claims) = (None::<usize>, 0u32);
+    let mut authed = auth.is_none();
     loop {
         let frame = match read_frame(&mut reader, max_body) {
             Ok(f) => f,
@@ -331,7 +345,16 @@ fn serve_connection<R: Read, W: Write + Send + 'static>(engine: Arc<Engine>, rea
                 })
             }};
         }
-        match Request::decode(ty, &frame.body) {
+        let decoded = Request::decode(ty, &frame.body);
+        if let (false, Some(expected), Ok(req)) = (authed, &auth, &decoded) {
+            let (resp, close) = auth_step(expected, &mut authed, req);
+            let _ = out.send(resp.to_frame(ty, id));
+            if close {
+                return;
+            }
+            continue;
+        }
+        match decoded {
             Err(e) => {
                 let resp = Response::Error(EngineError::new(ErrorCode::BadRequest, e.to_string()));
                 let _ = out.send(resp.to_frame(ty, id));
@@ -388,6 +411,7 @@ fn serve_connection<R: Read, W: Write + Send + 'static>(engine: Arc<Engine>, rea
 pub(crate) fn handle(engine: &Engine, req: Request) -> Result<Response> {
     Ok(match req {
         Request::Ping => Response::Pong,
+        Request::Auth(_) => Response::Authed,
         Request::PushJob(p) => Response::Push(engine.push(p)?),
         Request::ClaimNextJob { channel_id, lease_ms, wait_ms } => {
             Response::Claim(engine.claim(channel_id, lease_ms, wait_ms)?)
@@ -404,6 +428,40 @@ pub(crate) fn handle(engine: &Engine, req: Request) -> Result<Response> {
         }
         Request::GetQueueStats { channel_id } => Response::Stats(engine.stats(channel_id)?),
     })
+}
+
+/// Jeton exigé sur TCP : SOLID_ENGINE_AUTH_TOKEN, sinon `auth_token_file`, sinon `auth_token`.
+fn resolve_token(cfg: &solid_engine_core::config::ServerConfig) -> std::io::Result<Option<Arc<Vec<u8>>>> {
+    let token = if let Some(t) = std::env::var_os("SOLID_ENGINE_AUTH_TOKEN") {
+        t.to_string_lossy().into_owned()
+    } else if let Some(path) = &cfg.auth_token_file {
+        std::fs::read_to_string(path)?.lines().next().unwrap_or("").trim().to_owned()
+    } else if let Some(t) = &cfg.auth_token {
+        t.clone()
+    } else {
+        return Ok(None);
+    };
+    if token.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "auth token is empty"));
+    }
+    Ok(Some(Arc::new(token.into_bytes())))
+}
+
+/// Comparaison sans sortie anticipée sur le contenu (la longueur peut fuiter).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Barrière d'authentification d'une connexion non authentifiée. Renvoie la réponse à envoyer et
+/// si la connexion doit être fermée ; toute commande autre que AUTH, ou un jeton faux, la ferme.
+pub(crate) fn auth_step(expected: &[u8], authed: &mut bool, req: &Request) -> (Response, bool) {
+    match req {
+        Request::Auth(t) if constant_time_eq(t, expected) => {
+            *authed = true;
+            (Response::Authed, false)
+        }
+        _ => (Response::Error(EngineError::new(ErrorCode::Unauthorized, "authentication required")), true),
+    }
 }
 
 fn to_response(r: Result<Response>) -> Response {

@@ -89,6 +89,12 @@ pub struct LimitsConfig {
 pub struct ServerConfig {
     pub tcp_addr: Option<String>,
     pub unix_socket: Option<String>,
+    /// Permissions (octal) appliquées au socket Unix, par exemple 0o600.
+    pub unix_socket_mode: Option<u32>,
+    /// Jeton exigé sur les connexions TCP (AUTH). La variable SOLID_ENGINE_AUTH_TOKEN a priorité.
+    pub auth_token: Option<String>,
+    /// Fichier contenant le jeton (première ligne), prioritaire sur `auth_token`.
+    pub auth_token_file: Option<String>,
 }
 
 impl Default for Config {
@@ -146,7 +152,13 @@ impl Default for LimitsConfig {
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { tcp_addr: Some("127.0.0.1:7777".into()), unix_socket: None }
+        Self {
+            tcp_addr: Some("127.0.0.1:7777".into()),
+            unix_socket: None,
+            unix_socket_mode: None,
+            auth_token: None,
+            auth_token_file: None,
+        }
     }
 }
 

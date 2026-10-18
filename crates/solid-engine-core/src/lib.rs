@@ -46,6 +46,7 @@ pub enum ErrorCode {
     PayloadTooLarge = 6,
     Internal = 7,
     ShuttingDown = 8,
+    Unauthorized = 9,
 }
 
 impl ErrorCode {
@@ -58,6 +59,7 @@ impl ErrorCode {
             5 => Self::Overloaded,
             6 => Self::PayloadTooLarge,
             8 => Self::ShuttingDown,
+            9 => Self::Unauthorized,
             _ => Self::Internal,
         }
     }

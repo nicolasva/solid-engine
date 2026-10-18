@@ -11,6 +11,8 @@ const NACK_FAIL: u8 = 1;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
     Ping,
+    /// Authentification d'une connexion TCP (jeton partagé).
+    Auth(Vec<u8>),
     PushJob(PushRequest),
     ClaimNextJob { channel_id: u16, lease_ms: u32, wait_ms: u32 },
     AckJob(Reservation),
@@ -25,6 +27,7 @@ pub enum Request {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Response {
     Pong,
+    Authed,
     Push(PushOutcome),
     Claim(Option<ClaimedJob>),
     Ack,
@@ -51,6 +54,7 @@ impl Request {
     pub fn msg_type(&self) -> u8 {
         match self {
             Self::Ping => msg::PING,
+            Self::Auth(_) => msg::AUTH,
             Self::PushJob(_) => msg::PUSH_JOB,
             Self::ClaimNextJob { .. } => msg::CLAIM_NEXT_JOB,
             Self::AckJob(_) => msg::ACK_JOB,
@@ -67,6 +71,7 @@ impl Request {
         let mut b = Vec::new();
         match self {
             Self::Ping => {}
+            Self::Auth(t) => b.put_bytes(t),
             Self::PushJob(p) => {
                 b.put_u128(p.job_id);
                 b.put_u16(p.channel_id);
@@ -116,6 +121,7 @@ impl Request {
         let mut r = Reader::new(body);
         let req = match msg_type {
             msg::PING => Self::Ping,
+            msg::AUTH => Self::Auth(r.bytes()?),
             msg::PUSH_JOB => Self::PushJob(PushRequest {
                 job_id: r.u128()?,
                 channel_id: r.u16()?,
@@ -171,7 +177,7 @@ impl Response {
     pub fn encode_body(&self) -> Vec<u8> {
         let mut b = Vec::new();
         match self {
-            Self::Pong | Self::Ack | Self::Nack | Self::Cancel => {}
+            Self::Pong | Self::Authed | Self::Ack | Self::Nack | Self::Cancel => {}
             Self::Push(o) => {
                 b.put_u128(o.job_id);
                 b.push(o.duplicate as u8);
@@ -230,6 +236,7 @@ impl Response {
         } else {
             match msg_type & !msg::RESPONSE_BIT {
                 msg::PING => Self::Pong,
+                msg::AUTH => Self::Authed,
                 msg::PUSH_JOB => Self::Push(PushOutcome { job_id: r.u128()?, duplicate: r.u8()? != 0 }),
                 msg::CLAIM_NEXT_JOB => {
                     if r.u8()? == 0 {

@@ -52,7 +52,7 @@ pub fn reactor_count() -> usize {
 struct Shared {
     efd: i32,
     responses: Mutex<Vec<(u64, Frame)>>,
-    new_conns: Mutex<Vec<(u64, Stream)>>,
+    new_conns: Mutex<Vec<(u64, Stream, bool)>>,
 }
 
 impl Shared {
@@ -126,6 +126,7 @@ struct Conn {
     closing: bool,
     last_push_shard: Option<usize>,
     claims: u32,
+    authed: bool,
 }
 
 struct Reactor {
@@ -137,6 +138,7 @@ struct Reactor {
     max_body: usize,
     affinity: bool,
     live: Arc<AtomicUsize>,
+    auth: Option<Arc<Vec<u8>>>,
     prof: Prof,
     drain_us: u64,
     /// Prototype Zero-Dispatch (SOLID_ENGINE_REACTOR_DIRECT=1, Memory) : le réacteur possède son propre shard.
@@ -200,7 +202,12 @@ pub struct Handle {
 }
 
 /// Démarre `n` réacteurs ; renvoie leurs poignées (pour répartir les connexions) et leurs threads.
-pub fn start(engine: &Arc<Engine>, live: &Arc<AtomicUsize>, n: usize) -> (Vec<Handle>, Vec<std::thread::JoinHandle<()>>) {
+pub fn start(
+    engine: &Arc<Engine>,
+    live: &Arc<AtomicUsize>,
+    n: usize,
+    auth: Option<Arc<Vec<u8>>>,
+) -> (Vec<Handle>, Vec<std::thread::JoinHandle<()>>) {
     let mut handles = Vec::new();
     let mut threads = Vec::new();
     for index in 0..n {
@@ -219,6 +226,7 @@ pub fn start(engine: &Arc<Engine>, live: &Arc<AtomicUsize>, n: usize) -> (Vec<Ha
             max_body: engine.config().limits.max_payload_bytes + BODY_OVERHEAD,
             affinity: crate::engine::claim_affinity(),
             live: live.clone(),
+            auth: auth.clone(),
             prof: Prof::new(),
             direct: direct_shard(engine, n, index, &shared),
             multi: engine.shard_count() > 1,
@@ -231,9 +239,10 @@ pub fn start(engine: &Arc<Engine>, live: &Arc<AtomicUsize>, n: usize) -> (Vec<Ha
 }
 
 impl Handle {
-    pub fn add(&self, stream: impl Into<Stream>) {
+    /// `needs_auth` : la connexion doit s'authentifier (AUTH) avant toute autre commande.
+    pub fn add(&self, stream: impl Into<Stream>, needs_auth: bool) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        self.shared.new_conns.lock().unwrap().push((id, stream.into()));
+        self.shared.new_conns.lock().unwrap().push((id, stream.into(), needs_auth));
         self.shared.wake();
     }
 }
@@ -402,7 +411,7 @@ impl Reactor {
 
     fn adopt(&mut self) {
         let fresh = std::mem::take(&mut *self.shared.new_conns.lock().unwrap());
-        for (id, stream) in fresh {
+        for (id, stream, needs_auth) in fresh {
             let mut ev = EpollEvent { events: EPOLLIN, data: id };
             if unsafe { epoll_ctl(self.ep, CTL_ADD, stream.as_raw_fd(), &mut ev) } != 0 {
                 self.live.fetch_sub(1, Ordering::SeqCst);
@@ -421,6 +430,7 @@ impl Reactor {
                     closing: false,
                     last_push_shard: None,
                     claims: 0,
+                    authed: !needs_auth,
                 },
             );
         }
@@ -525,6 +535,12 @@ impl Reactor {
         let t = self.prof.now();
         let decoded = Request::decode(ty, &frame.body);
         self.prof.add(2, t);
+        if let (false, Some(expected), Ok(req)) = (c.authed, &self.auth, &decoded) {
+            let (resp, close) = crate::net::auth_step(expected, &mut c.authed, req);
+            let _ = write_frame(&mut c.out, &resp.to_frame(ty, rid));
+            c.closing |= close;
+            return;
+        }
         let t = self.prof.now();
         if let (Some(d), Ok(req), false) = (&self.direct, &decoded, self.multi) {
             let mut d = d.borrow_mut();
@@ -532,6 +548,7 @@ impl Reactor {
             let now = now_ms();
             let resp = match req.clone() {
                 Request::Ping => Response::Pong,
+                Request::Auth(_) => Response::Authed,
                 Request::PushJob(mut p) => {
                     if p.job_id == 0 {
                         *next_id += 1;
