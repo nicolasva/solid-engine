@@ -30,16 +30,57 @@ struct Job {
 
 /// Trace d'un job terminal (dédoublonnage, `get`, fencing) : sans payload, bail ni réservation.
 struct Done {
+    fencing_token: u64,
+    purge_at: u64,
+    /// `created_at` et `scheduled_at` stockés comme écart (ms) en dessous de `purge_at` ; `WIDE` renvoie à `Shard::wide`.
+    created_off: u32,
+    scheduled_off: u32,
+    attempts: u32,
+    max_attempts: u32,
+    payload_len: u32,
     channel_id: u16,
     state: JobState,
     priority: u8,
-    attempts: u32,
-    max_attempts: u32,
-    fencing_token: u64,
-    scheduled_at: u64,
-    created_at: u64,
-    payload_len: u32,
-    purge_at: u64,
+}
+
+const WIDE: u32 = u32::MAX;
+
+/// Clé alignée sur 8 octets : un `u128` impose 16 et gonfle l'emplacement de la table `done` (56 o au lieu de 64).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Id([u64; 2]);
+
+impl Id {
+    fn new(v: u128) -> Self {
+        Id([v as u64, (v >> 64) as u64])
+    }
+    fn get(self) -> u128 {
+        self.0[0] as u128 | (self.0[1] as u128) << 64
+    }
+}
+
+fn offset_below(purge_at: u64, t: u64) -> Option<u32> {
+    purge_at.checked_sub(t).filter(|d| *d < WIDE as u64).map(|d| d as u32)
+}
+
+impl Done {
+    /// Renvoie aussi les horodatages exacts quand l'un des deux ne tient pas dans un écart u32 (rare : > 49 jours ou après `purge_at`).
+    fn from_job(j: &Job, purge_at: u64) -> (Self, Option<(u64, u64)>) {
+        let offs = offset_below(purge_at, j.created_at).zip(offset_below(purge_at, j.scheduled_at));
+        let (created_off, scheduled_off) = offs.unwrap_or((WIDE, WIDE));
+        let d = Done {
+            fencing_token: j.fencing_token,
+            purge_at,
+            created_off,
+            scheduled_off,
+            attempts: j.attempts,
+            max_attempts: j.max_attempts,
+            payload_len: j.payload_len,
+            channel_id: j.channel_id,
+            state: j.state,
+            priority: j.priority,
+        };
+        (d, offs.is_none().then_some((j.created_at, j.scheduled_at)))
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -72,7 +113,9 @@ pub struct Shard {
     id: u16,
     cfg: Arc<Config>,
     jobs: HashMap<u128, Job>,
-    done: HashMap<u128, Done>,
+    done: HashMap<Id, Done>,
+    /// Horodatages exacts des rares jobs terminés dont l'écart à `purge_at` ne tient pas dans un u32.
+    wide: HashMap<Id, (u64, u64)>,
     queues: HashMap<u16, Queue>,
     counts: HashMap<u16, [u64; STATES]>,
     scheduled: BinaryHeap<Deadline>,
@@ -98,6 +141,7 @@ impl Shard {
             cfg,
             jobs: HashMap::new(),
             done: HashMap::new(),
+            wide: HashMap::new(),
             queues: HashMap::new(),
             counts: HashMap::new(),
             scheduled: BinaryHeap::new(),
@@ -230,7 +274,7 @@ impl Shard {
 
     /// Répartition estimée de la mémoire des jobs terminés et de la rétention (diagnostic).
     pub fn mem_report(&self) -> MemReport {
-        let slot = std::mem::size_of::<(u128, Done)>();
+        let slot = std::mem::size_of::<(Id, Done)>();
         MemReport {
             active_jobs: self.jobs.len(),
             active_capacity: self.jobs.capacity(),
@@ -254,7 +298,7 @@ impl Shard {
             self.retention
                 .first_key_value()
                 .and_then(|(_, q)| q.front())
-                .and_then(|id| self.done.get(id))
+                .and_then(|id| self.done.get(&Id::new(*id)))
                 .map(|d| d.purge_at),
         ]
         .into_iter()
@@ -295,12 +339,15 @@ impl Shard {
         while let Some(mut slot) = self.retention.first_entry() {
             let q = slot.get_mut();
             while let Some(&id) = q.front() {
-                if self.done.get(&id).is_some_and(|d| d.purge_at > now) {
+                if self.done.get(&Id::new(id)).is_some_and(|d| d.purge_at > now) {
                     break;
                 }
                 q.pop_front();
                 self.retention_len -= 1;
-                if let Some(d) = self.done.remove(&id) {
+                if let Some(d) = self.done.remove(&Id::new(id)) {
+                    if d.created_off == WIDE {
+                        self.wide.remove(&Id::new(id));
+                    }
                     let c = &mut self.counts.entry(d.channel_id).or_insert([0; STATES])[d.state as usize];
                     *c = c.wrapping_add_signed(-1);
                 }
@@ -336,7 +383,7 @@ impl Shard {
             return Err(EngineError::new(ErrorCode::PayloadTooLarge, "payload exceeds max_payload_bytes"));
         }
         let id = if req.job_id == 0 { self.generate_id(now) } else { req.job_id };
-        if self.jobs.contains_key(&id) || self.done.contains_key(&id) {
+        if self.jobs.contains_key(&id) || self.done.contains_key(&Id::new(id)) {
             return Ok(PushOutcome { job_id: id, duplicate: true });
         }
         if self.jobs.len() + self.done.len() >= self.cfg.limits.max_jobs_per_shard {
@@ -412,7 +459,8 @@ impl Shard {
 
     pub fn get(&mut self, job_id: u128, now: u64) -> Result<JobView> {
         self.tick(now);
-        if let Some(d) = self.done.get(&job_id) {
+        if let Some(d) = self.done.get(&Id::new(job_id)) {
+            let (created_at, scheduled_at) = self.done_times(Id::new(job_id), d);
             return Ok(JobView {
                 job_id,
                 channel_id: d.channel_id,
@@ -422,8 +470,8 @@ impl Shard {
                 max_attempts: d.max_attempts,
                 fencing_token: d.fencing_token,
                 lease_deadline: 0,
-                scheduled_at: d.scheduled_at,
-                created_at: d.created_at,
+                scheduled_at,
+                created_at,
                 payload_length: d.payload_len,
             });
         }
@@ -447,7 +495,7 @@ impl Shard {
         self.tick(now);
         let state = match self.jobs.get(&job_id) {
             Some(j) => j.state,
-            None => self.done.get(&job_id).ok_or_else(not_found)?.state,
+            None => self.done.get(&Id::new(job_id)).ok_or_else(not_found)?.state,
         };
         if !matches!(state, JobState::Ready | JobState::Scheduled) {
             return Err(EngineError::new(ErrorCode::InvalidState, format!("cannot cancel a {state:?} job")));
@@ -482,7 +530,8 @@ impl Shard {
         w.u64(self.next_seq);
         w.u64((self.jobs.len() + self.done.len()) as u64);
         for (id, d) in &self.done {
-            w.u128(*id);
+            let (created_at, scheduled_at) = self.done_times(*id, d);
+            w.u128(id.get());
             w.u16(d.channel_id);
             w.u8(d.state as u8);
             w.u8(d.priority);
@@ -491,8 +540,8 @@ impl Shard {
             w.u64(d.fencing_token);
             w.u64(0);
             w.u64(0);
-            w.u64(d.scheduled_at);
-            w.u64(d.created_at);
+            w.u64(scheduled_at);
+            w.u64(created_at);
             w.u64(0);
             w.u64(d.purge_at);
             w.u32(d.payload_len);
@@ -561,21 +610,7 @@ impl Shard {
                 JobState::Scheduled => shard.scheduled.push(Reverse((j.scheduled_at, id, seq))),
                 JobState::Claimed => shard.leases.push(Reverse((j.lease_deadline, id, j.fencing_token))),
                 _ => {
-                    shard.done.insert(
-                        id,
-                        Done {
-                            channel_id: ch,
-                            state: j.state,
-                            priority: prio,
-                            attempts: j.attempts,
-                            max_attempts: j.max_attempts,
-                            fencing_token: j.fencing_token,
-                            scheduled_at: j.scheduled_at,
-                            created_at: j.created_at,
-                            payload_len: j.payload_len,
-                            purge_at,
-                        },
-                    );
+                    shard.insert_done(id, &j, purge_at);
                     expiring.push((purge_at, id));
                     continue;
                 }
@@ -591,7 +626,7 @@ impl Shard {
 
     fn validate(&self, r: &Reservation) -> Result<()> {
         let Some(j) = self.jobs.get(&r.job_id) else {
-            return Err(if self.done.contains_key(&r.job_id) { stale() } else { not_found() });
+            return Err(if self.done.contains_key(&Id::new(r.job_id)) { stale() } else { not_found() });
         };
         if j.state != JobState::Claimed || j.reservation_id != r.reservation_id || j.fencing_token != r.fencing_token
         {
@@ -617,6 +652,21 @@ impl Shard {
         self.commit(Record::Dead { job_id: id, at: now });
     }
 
+    fn insert_done(&mut self, id: u128, j: &Job, purge_at: u64) {
+        let (d, wide) = Done::from_job(j, purge_at);
+        if let Some(t) = wide {
+            self.wide.insert(Id::new(id), t);
+        }
+        self.done.insert(Id::new(id), d);
+    }
+
+    fn done_times(&self, id: Id, d: &Done) -> (u64, u64) {
+        if d.created_off == WIDE {
+            return self.wide[&id];
+        }
+        (d.purge_at - d.created_off as u64, d.purge_at - d.scheduled_off as u64)
+    }
+
     fn expire_at(&mut self, id: u128, purge_at: u64) {
         self.retention.entry(purge_at >> RETENTION_SLOT_SHIFT).or_default().push_back(id);
         self.retention_len += 1;
@@ -625,21 +675,7 @@ impl Shard {
     fn finish(&mut self, id: u128, purge_at: u64) {
         // Le job terminal quitte la table des jobs actifs : seule la trace (dédoublonnage, fencing) est conservée.
         let j = self.jobs.remove(&id).unwrap();
-        self.done.insert(
-            id,
-            Done {
-                channel_id: j.channel_id,
-                state: j.state,
-                priority: j.priority,
-                attempts: j.attempts,
-                max_attempts: j.max_attempts,
-                fencing_token: j.fencing_token,
-                scheduled_at: j.scheduled_at,
-                created_at: j.created_at,
-                payload_len: j.payload_len,
-                purge_at,
-            },
-        );
+        self.insert_done(id, &j, purge_at);
         self.expire_at(id, purge_at);
     }
 
@@ -903,6 +939,53 @@ mod tests {
         assert_eq!(s.get(1, 1).unwrap().payload_length, len);
         assert!(s.jobs.get(&1).is_none());
         let restored = Shard::from_snapshot(0, s.cfg.clone(), &s.encode_snapshot()).unwrap();
-        assert_eq!(restored.done.get(&1).unwrap().payload_len, len);
+        assert_eq!(restored.done.get(&Id::new(1)).unwrap().payload_len, len);
+    }
+
+    #[test]
+    fn done_slot_is_56_bytes() {
+        assert_eq!(std::mem::size_of::<(Id, Done)>(), 56);
+    }
+
+    #[test]
+    fn offsets_switch_to_wide_exactly_at_u32_max() {
+        assert_eq!(offset_below(10_000_000_000, 10_000_000_000 - (WIDE as u64 - 1)), Some(WIDE - 1));
+        assert_eq!(offset_below(10_000_000_000, 10_000_000_000 - WIDE as u64), None);
+        assert_eq!(offset_below(5, 6), None);
+        assert_eq!(offset_below(5, 5), Some(0));
+    }
+
+    #[test]
+    fn schedule_after_purge_deadline_stays_exact_through_snapshot_and_purge() {
+        let mut s = shard_with(|c| c.jobs.completed_retention_ms = 1000);
+        // Annulé avant son échéance, qui tombe après `purge_at`.
+        s.push(push(2, 0, 10_000_000), 5).unwrap();
+        s.cancel(2, 5).unwrap();
+        assert_eq!(s.wide.len(), 1);
+        let mut r = Shard::from_snapshot(0, s.cfg.clone(), &s.encode_snapshot()).unwrap();
+        for sh in [&mut s, &mut r] {
+            let v = sh.get(2, 6).unwrap();
+            assert_eq!((v.created_at, v.scheduled_at), (5, 10_000_005));
+        }
+        assert_eq!(r.wide.len(), 1);
+        assert_eq!(r.get(2, 1005).unwrap_err().code, ErrorCode::NotFound);
+        assert!(r.wide.is_empty());
+    }
+
+    #[test]
+    fn job_completed_more_than_u32_ms_after_creation_stays_exact() {
+        let mut s = shard_with(|c| c.jobs.completed_retention_ms = 1000);
+        let late = 60 * 24 * 3600 * 1000u64;
+        s.push(push(1, 0, 0), 0).unwrap();
+        let c = s.claim(1, 0, late).unwrap().unwrap();
+        s.ack(res(&c), late).unwrap();
+        assert_eq!(s.wide.len(), 1);
+        let mut r = Shard::from_snapshot(0, s.cfg.clone(), &s.encode_snapshot()).unwrap();
+        for sh in [&mut s, &mut r] {
+            let v = sh.get(1, late + 1).unwrap();
+            assert_eq!((v.created_at, v.scheduled_at), (0, 0));
+        }
+        assert_eq!(r.get(1, late + 1000).unwrap_err().code, ErrorCode::NotFound);
+        assert!(r.wide.is_empty());
     }
 }
