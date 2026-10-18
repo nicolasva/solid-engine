@@ -11,8 +11,9 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
-use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 const MAX_IN_FLIGHT: usize = 256;
@@ -51,7 +52,7 @@ pub fn reactor_count() -> usize {
 struct Shared {
     efd: i32,
     responses: Mutex<Vec<(u64, Frame)>>,
-    new_conns: Mutex<Vec<(u64, TcpStream)>>,
+    new_conns: Mutex<Vec<(u64, Stream)>>,
 }
 
 impl Shared {
@@ -65,7 +66,7 @@ impl Shared {
         let was_empty = q.is_empty();
         q.push((conn, frame));
         drop(q);
-        if was_empty && !IN_REACTOR_FLUSH.with(|f| f.get()) {
+        if was_empty && IN_REACTOR_FLUSH.with(|f| f.get()) != self as *const Shared as usize {
             self.wake();
         }
     }
@@ -115,7 +116,7 @@ impl Prof {
 }
 
 struct Conn {
-    stream: TcpStream,
+    stream: Stream,
     inbuf: Vec<u8>,
     pos: usize,
     out: Vec<u8>,
@@ -140,18 +141,69 @@ struct Reactor {
     drain_us: u64,
     /// Prototype Zero-Dispatch (SOLID_ENGINE_REACTOR_DIRECT=1, Memory) : le réacteur possède son propre shard.
     direct: Option<std::cell::RefCell<Direct>>,
+    /// Mode direct avec plusieurs shards : les commandes d'un autre shard passent par sa boîte aux lettres.
+    multi: bool,
 }
 
+/// Transport d'une connexion : TCP ou socket Unix (même traitement des commandes).
+pub enum Stream {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+impl From<TcpStream> for Stream {
+    fn from(s: TcpStream) -> Self {
+        Stream::Tcp(s)
+    }
+}
+
+impl From<UnixStream> for Stream {
+    fn from(s: UnixStream) -> Self {
+        Stream::Unix(s)
+    }
+}
+
+impl AsRawFd for Stream {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            Stream::Tcp(s) => s.as_raw_fd(),
+            Stream::Unix(s) => s.as_raw_fd(),
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => s.read(buf),
+            Stream::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => s.write(buf),
+            Stream::Unix(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 pub struct Handle {
     shared: Arc<Shared>,
-    next_id: u64,
+    next_id: Arc<AtomicU64>,
 }
 
 /// Démarre `n` réacteurs ; renvoie leurs poignées (pour répartir les connexions) et leurs threads.
 pub fn start(engine: &Arc<Engine>, live: &Arc<AtomicUsize>, n: usize) -> (Vec<Handle>, Vec<std::thread::JoinHandle<()>>) {
     let mut handles = Vec::new();
     let mut threads = Vec::new();
-    for _ in 0..n {
+    for index in 0..n {
         let ep = unsafe { epoll_create1(0x80000) };
         let efd = unsafe { eventfd(0, 0x800 | 0x80000) };
         assert!(ep >= 0 && efd >= 0, "epoll/eventfd indisponibles");
@@ -168,19 +220,20 @@ pub fn start(engine: &Arc<Engine>, live: &Arc<AtomicUsize>, n: usize) -> (Vec<Ha
             affinity: crate::engine::claim_affinity(),
             live: live.clone(),
             prof: Prof::new(),
-            direct: direct_shard(engine, n),
+            direct: direct_shard(engine, n, index, &shared),
+            multi: engine.shard_count() > 1,
             drain_us: std::env::var("SOLID_ENGINE_REACTOR_DRAIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         };
         threads.push(std::thread::Builder::new().name("se-reactor".into()).spawn(move || r.run()).unwrap());
-        handles.push(Handle { shared, next_id: 0 });
+        handles.push(Handle { shared, next_id: Arc::new(AtomicU64::new(0)) });
     }
     (handles, threads)
 }
 
 impl Handle {
-    pub fn add(&mut self, stream: TcpStream) {
-        self.next_id += 1;
-        self.shared.new_conns.lock().unwrap().push((self.next_id, stream));
+    pub fn add(&self, stream: impl Into<Stream>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        self.shared.new_conns.lock().unwrap().push((id, stream.into()));
         self.shared.wake();
     }
 }
@@ -207,6 +260,11 @@ impl Reactor {
                 let (flags, id) = (ev.events, ev.data);
                 if id == WAKE_ID {
                     woken = true;
+                    if self.direct.is_some() {
+                        // Lu avant de vider la boîte aux lettres : un envoi postérieur réécrit l'eventfd.
+                        let mut buf = [0u8; 8];
+                        unsafe { read(self.shared.efd, buf.as_mut_ptr().cast(), 8) };
+                    }
                     continue;
                 }
                 if flags & (EPOLLERR | EPOLLHUP) != 0 && flags & EPOLLIN == 0 {
@@ -224,8 +282,10 @@ impl Reactor {
             }
             if woken {
                 let t = self.prof.now();
-                let mut buf = [0u8; 8];
-                unsafe { read(self.shared.efd, buf.as_mut_ptr().cast(), 8) };
+                if self.direct.is_none() {
+                    let mut buf = [0u8; 8];
+                    unsafe { read(self.shared.efd, buf.as_mut_ptr().cast(), 8) };
+                }
                 if self.drain_us > 0 {
                     std::thread::sleep(std::time::Duration::from_micros(self.drain_us));
                 }
@@ -278,16 +338,19 @@ impl Reactor {
 
     fn direct_flush(&self) {
         let mut d = self.direct.as_ref().unwrap().borrow_mut();
-        let Direct { shard, durable, failed, pending, waiters, .. } = &mut *d;
+        let Direct { shard, durable, failed, pending, waiters, mailbox, .. } = &mut *d;
         let now = now_ms();
+        mailbox.apply(shard, pending, failed, now);
         shard.tick(now);
         if !waiters.is_empty() {
             self.serve_waiters(shard, pending, failed, waiters, now);
         }
-        IN_REACTOR_FLUSH.with(|f| f.set(true));
+        IN_REACTOR_FLUSH.with(|f| f.set(Arc::as_ptr(&self.shared) as usize));
         crate::engine::flush(shard, durable, failed, pending, self.engine.config());
-        IN_REACTOR_FLUSH.with(|f| f.set(false));
-        shard.take_ready_flag();
+        IN_REACTOR_FLUSH.with(|f| f.set(0));
+        if shard.take_ready_flag() && self.multi {
+            self.engine.notify_ready();
+        }
     }
 
     fn serve_waiters(
@@ -463,7 +526,7 @@ impl Reactor {
         let decoded = Request::decode(ty, &frame.body);
         self.prof.add(2, t);
         let t = self.prof.now();
-        if let (Some(d), Ok(req)) = (&self.direct, &decoded) {
+        if let (Some(d), Ok(req), false) = (&self.direct, &decoded, self.multi) {
             let mut d = d.borrow_mut();
             let Direct { shard, pending, next_id, failed, waiters, .. } = &mut *d;
             let now = now_ms();
@@ -528,6 +591,28 @@ impl Reactor {
                 let resp = Response::Error(EngineError::new(ErrorCode::BadRequest, e.to_string()));
                 let _ = write_frame(&mut c.out, &resp.to_frame(ty, rid));
             }
+            Ok(Request::PushJob(mut p)) if self.direct.is_some() => {
+                let shard = engine.push_shard(&mut p);
+                if shard == self.index() {
+                    self.run_local(c, id, ty, rid, |sh, now| Some(to_response(sh.push(p, now).map(Response::Push))));
+                } else {
+                    submit!(|d| engine.push_async(p, d), Response::Push);
+                }
+                c.last_push_shard = Some(shard);
+            }
+            Ok(Request::AckJob(r)) if self.owns(&r) => {
+                {
+                self.run_local(c, id, ty, rid, |sh, now| Some(to_response(sh.ack(r, now).map(|_| Response::Ack))));
+            }
+            }
+            Ok(Request::NackJob { reservation, kind }) if self.owns(&reservation) => {
+                self.run_local(c, id, ty, rid, |sh, now| Some(to_response(sh.nack(reservation, kind, now).map(|_| Response::Nack))));
+            }
+            Ok(Request::ExtendLease { reservation, lease_ms }) if self.owns(&reservation) => {
+                self.run_local(c, id, ty, rid, |sh, now| {
+                    Some(to_response(sh.extend_lease(reservation, lease_ms, now).map(|lease_deadline| Response::ExtendLease { lease_deadline })))
+                });
+            }
             Ok(Request::PushJob(p)) => c.last_push_shard = Some(submit!(|d| engine.push_async(p, d), Response::Push)),
             Ok(Request::AckJob(r)) => submit!(|d| engine.ack_async(r, d), |_| Response::Ack),
             Ok(Request::NackJob { reservation, kind }) => {
@@ -538,9 +623,20 @@ impl Reactor {
                 |lease_deadline| Response::ExtendLease { lease_deadline }
             ),
             Ok(Request::ClaimNextJob { channel_id, lease_ms, wait_ms }) => {
+                c.claims = c.claims.wrapping_add(1);
+                // Un job local est servi sans changer de thread ; un tour sur 8 balaie d'abord les autres shards.
+                if self.direct.is_some()
+                    && c.claims % 8 != 0
+                    && self.run_local(c, id, ty, rid, |sh, now| match sh.claim(channel_id, lease_ms, now) {
+                        Ok(None) => None,
+                        other => Some(to_response(other.map(Response::Claim))),
+                    })
+                {
+                    self.prof.add(3, t);
+                    return;
+                }
                 c.inflight += 1;
                 let (e, shared) = (engine.clone(), shared.clone());
-                c.claims = c.claims.wrapping_add(1);
                 let hint = c.last_push_shard.filter(|_| self.affinity && c.claims % 8 != 0);
                 let done = move |result: Result<Option<_>>| match result {
                     Ok(None) if wait_ms > 0 => {
@@ -566,6 +662,38 @@ impl Reactor {
             }
         }
         self.prof.add(3, t);
+    }
+
+    fn index(&self) -> usize {
+        self.direct.as_ref().map_or(0, |d| d.borrow().index)
+    }
+
+    fn owns(&self, r: &Reservation) -> bool {
+        self.direct.is_some() && self.engine.reservation_shard(r).is_ok_and(|s| s == self.index())
+    }
+
+    /// Exécute `f` sur le shard local ; la réponse part au flush (après le fsync en strict).
+    /// Renvoie faux, sans rien envoyer, si `f` renvoie `None`.
+    fn run_local(
+        &self,
+        c: &mut Conn,
+        id: u64,
+        ty: u8,
+        rid: u64,
+        f: impl FnOnce(&mut solid_engine_core::shard::Shard, u64) -> Option<Response>,
+    ) -> bool {
+        let mut d = self.direct.as_ref().unwrap().borrow_mut();
+        let Some(resp) = f(&mut d.shard, now_ms()) else { return false };
+        c.inflight += 1;
+        let shared = self.shared.clone();
+        d.pending.push(Box::new(move |failure| {
+            let resp = match failure {
+                Some(e) => Response::Error(e.clone()),
+                None => resp,
+            };
+            shared.respond(id, resp.to_frame(ty, rid));
+        }));
+        true
     }
 
     /// Écrit ce qui est prêt, ferme si nécessaire et ajuste l'intérêt epoll.
@@ -626,6 +754,8 @@ struct Direct {
     failed: Option<EngineError>,
     pending: crate::engine::Pending,
     next_id: u128,
+    index: usize,
+    mailbox: Arc<crate::engine::Mailbox>,
     waiters: Vec<Waiter>,
 }
 
@@ -639,18 +769,28 @@ struct Waiter {
     deadline: u64,
 }
 
-fn direct_shard(engine: &Arc<Engine>, reactors: usize) -> Option<std::cell::RefCell<Direct>> {
+fn direct_shard(engine: &Arc<Engine>, reactors: usize, index: usize, shared: &Shared) -> Option<std::cell::RefCell<Direct>> {
     if !crate::engine::direct_enabled() {
         return None;
     }
-    assert!(reactors == 1, "REACTOR_DIRECT : un seul réacteur");
-    let (shard, durable) = engine.take_direct().expect("shard direct indisponible");
-    Some(std::cell::RefCell::new(Direct { shard, durable, failed: None, pending: Vec::new(), next_id: 1u128 << 100, waiters: Vec::new() }))
+    assert!(reactors == engine.shard_count(), "REACTOR_DIRECT : un réacteur par shard");
+    let (shard, durable, mailbox) = engine.take_direct(index).expect("shard direct indisponible");
+    mailbox.set_wake_fd(shared.efd);
+    Some(std::cell::RefCell::new(Direct {
+        shard,
+        durable,
+        failed: None,
+        pending: Vec::new(),
+        next_id: ((index as u128 + 1) << 100) | 1,
+        index,
+        mailbox,
+        waiters: Vec::new(),
+    }))
 }
 
 thread_local! {
-    /// Vrai pendant `flush` sur le réacteur : les réponses sont relevées juste après, sans réveil.
-    static IN_REACTOR_FLUSH: Cell<bool> = const { Cell::new(false) };
+    /// Adresse du `Shared` du réacteur pendant son `flush` : ses réponses sont relevées juste après, sans réveil.
+    static IN_REACTOR_FLUSH: Cell<usize> = const { Cell::new(0) };
 }
 
 fn to_response(r: Result<Response>) -> Response {

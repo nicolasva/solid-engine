@@ -268,6 +268,32 @@ En strict, le plafond (~35 k jobs/s) est fixé par le fsync, pas par le réseau 
 
 Le mode direct gère désormais `Ping`, `Cancel`, `GetJob`, `GetQueueStats`, ainsi que `ClaimNextJob` avec `wait_ms` et `WaitForJob` : les attentes sont parquées sans bloquer le thread, réveillées au tour de boucle suivant et expirées par deadline. Une attente orpheline (client parti) peut réserver un job, qui revient après expiration du bail (comme sur le chemin classique, at-least-once).
 
-Limites : un seul shard, TCP uniquement (le démarrage échoue si `unix_socket` est configuré). Les tests `integration`, `pipelining` et `durability` passent avec `SOLID_ENGINE_REACTORS=1 SOLID_ENGINE_REACTOR_DIRECT=1` (ceux qui exigent plusieurs shards ou un socket Unix sont ignorés dans ce mode).
+Le socket Unix est servi par le même réacteur que TCP (même traitement des commandes, `reactor::Stream`). Limite : un seul shard. Les tests `integration`, `pipelining`, `durability` (dont le SIGKILL en Strict) et `fault` passent avec `SOLID_ENGINE_REACTORS=1 SOLID_ENGINE_REACTOR_DIRECT=1`, avec 1 shard forcé par les tests ; `claim_affinity` et `durable_ack`, qui exigent plusieurs shards, ne s'y appliquent pas.
 
 Non-régression Memory (1 shard, 8×8, 3 passes) : 14,3–14,4 µs/job et p50 154–182 µs à 50 k ; saturation 154–167 k jobs/s (6,0–6,3 µs/job). Même réserves : Docker Desktop, Redis Lua sans leases ni retries, pas de Linux natif.
+
+Non-régression WAL après l'étape 2 (direct, 3 passes) : balanced 19,9–20,5 µs/job à 50 k, saturation 141–143 k/s (7,8–8,1 µs/job) ; strict 15,5–16,0 µs/job à 50 k, 31,7–32,2 k/s (plafond fsync). Le test `fault` (erreurs d'E/S du WAL) passe en mode direct. Strict est un peu au-dessus des mesures précédentes (12,9–15,0 µs) et la saturation balanced un peu en dessous (146–156 k/s) : écart modeste, à confirmer avec davantage de passes.
+
+##### Plusieurs threads propriétaires (multi-shards)
+
+Avec `SOLID_ENGINE_REACTORS=1 SOLID_ENGINE_REACTOR_DIRECT=1`, un réacteur est créé par shard (le nombre de réacteurs suit `engine.shards`). Le réacteur i possède le shard i et son WAL : un `fsync` d'un shard ne libère jamais la réponse d'un autre. Une commande destinée à un autre shard passe par la boîte aux lettres de son propriétaire (même `Cmd`, même `apply_cmd` que le chemin classique), avec réveil `eventfd` ; la réponse revient au réacteur d'origine. L'`eventfd` doit être vidé avant `Mailbox::apply`, sinon un envoi concurrent est perdu jusqu'au timeout. `durable_ack` et `claim_affinity` passent en direct ; toute la suite passe en classique et en direct (4 shards).
+
+Memory, 8×8, 3 passes entrelacées, `BENCH_PARTITION=1`, `SOLID_ENGINE_CLAIM_AFFINITY=1` :
+
+| Shards | CPU/job à 50 k, R=0 | CPU/job à 50 k, direct | Saturation R=0 | Saturation direct |
+|---|---|---|---|---|
+| 2 | 29,3–30,2 µs | 21,9–23,3 µs | 129–143 k/s | 169–195 k/s |
+| 4 | 31,5–32,1 µs | 22,7–29,2 µs | 132–151 k/s | 146–175 k/s |
+
+Le p50 à 50 k vaut 157–335 µs en direct contre 274–476 µs en R=0 ; le p99 (≈ 3,6 ms) est inchangé.
+
+Réserves : un premier lot avait donné un débit saturé bimodal (18–85 k jobs/s). Il n'a pas été reproduit sur 35 passes ultérieures, et un détecteur de réveil perdu n'a rien signalé ; sa cause reste non établie (bruit de la VM possible). Le gain à 4 shards est plus faible et plus variable qu'à 2. Docker Desktop, pas de Linux natif.
+
+Avec WAL (2 shards, 8×8, 3 passes entrelacées) :
+
+| Mode | CPU/job à 50 k, R=0 → direct | Saturation, R=0 → direct |
+|---|---|---|
+| Balanced | 31,6–33,2 → 27,9–30,3 µs | 124–128 k → 155–164 k/s |
+| Strict | 29–37 → 23–30 µs | 24,1–24,7 k → 24,9–25,6 k/s |
+
+Balanced : gain de CPU d'environ 10 %, débit saturé +25 à 30 %. Strict : le `fsync` de la VM plafonne le débit à ≈ 25 k jobs/s, donc 50 k n'est jamais atteint (21–24 k réels) et les CPU/job ne sont pas comparables à charge égale ; le gain de débit (2 à 5 %) est faible. Le `fsync` Docker Desktop n'est pas représentatif d'un disque natif ; 4 shards en WAL non mesurés.

@@ -27,25 +27,32 @@ pub struct Server {
 impl Server {
     pub fn start(cfg: Config) -> std::io::Result<Self> {
         let server_cfg = cfg.server.clone();
-        if crate::engine::direct_enabled() && server_cfg.unix_socket.is_some() {
-            return Err(std::io::Error::other("SOLID_ENGINE_REACTOR_DIRECT ne gère pas encore le socket Unix"));
-        }
+        let direct_shards = crate::engine::direct_enabled().then_some(cfg.engine.shards);
         let engine = Engine::start(cfg).map_err(std::io::Error::other)?;
         let conns = Arc::new(AtomicUsize::new(0));
         let mut accept_threads = Vec::new();
         let (mut tcp_addr, mut unix_path) = (None, None);
+
+        // En mode direct, chaque shard est possédé par son propre réacteur.
+        let reactors = direct_shards.unwrap_or_else(reactor_count);
+        #[cfg(target_os = "linux")]
+        let handles = if reactors > 0 {
+            let (handles, threads) = crate::reactor::start(&engine, &conns, reactors);
+            accept_threads.extend(threads);
+            handles
+        } else {
+            Vec::new()
+        };
 
         if let Some(addr) = &server_cfg.tcp_addr {
             let listener = TcpListener::bind(addr)?;
             listener.set_nonblocking(true)?;
             tcp_addr = Some(listener.local_addr()?);
             let (e, c) = (engine.clone(), conns.clone());
-            let reactors = reactor_count();
             if reactors > 0 {
                 #[cfg(target_os = "linux")]
                 {
-                    let (mut handles, threads) = crate::reactor::start(&engine, &conns, reactors);
-                    accept_threads.extend(threads);
+                    let handles = handles.clone();
                     accept_threads.push(std::thread::spawn(move || {
                         let mut next = 0usize;
                         while !e.is_shutting_down() {
@@ -87,6 +94,31 @@ impl Server {
             listener.set_nonblocking(true)?;
             unix_path = Some(PathBuf::from(path));
             let (e, c) = (engine.clone(), conns.clone());
+            #[cfg(target_os = "linux")]
+            if reactors > 0 {
+                let handles = handles.clone();
+                accept_threads.push(std::thread::spawn(move || {
+                    let mut next = 0usize;
+                    while !e.is_shutting_down() {
+                        match listener.accept() {
+                            Ok((s, _)) => {
+                                if c.fetch_add(1, Ordering::SeqCst) >= e.config().limits.max_connections {
+                                    c.fetch_sub(1, Ordering::SeqCst);
+                                    continue;
+                                }
+                                if s.set_nonblocking(true).is_err() {
+                                    c.fetch_sub(1, Ordering::SeqCst);
+                                    continue;
+                                }
+                                handles[next % reactors].add(s);
+                                next += 1;
+                            }
+                            Err(_) => std::thread::sleep(ACCEPT_POLL),
+                        }
+                    }
+                }));
+                return Ok(Self { engine, tcp_addr, unix_path, accept_threads });
+            }
             accept_threads.push(std::thread::spawn(move || {
                 accept_loop(&e, &c, || {
                     let (s, _) = listener.accept()?;

@@ -11,9 +11,6 @@ fn start(tweak: impl FnOnce(&mut Config)) -> (Server, String) {
     let mut cfg = Config::default();
     cfg.server.tcp_addr = Some("127.0.0.1:0".into());
     tweak(&mut cfg);
-    if std::env::var_os("SOLID_ENGINE_REACTOR_DIRECT").is_some() {
-        cfg.engine.shards = 1;
-    }
     let server = Server::start(cfg).unwrap();
     let addr = server.tcp_addr().unwrap().to_string();
     (server, addr)
@@ -44,9 +41,6 @@ fn reservation(j: &ClaimedJob) -> Reservation {
 
 #[test]
 fn push_claim_ack_over_tcp_and_unix() {
-    if std::env::var_os("SOLID_ENGINE_REACTOR_DIRECT").is_some() {
-        return;
-    }
     let sock = std::env::temp_dir().join(format!("solid-engine-test-{}.sock", std::process::id()));
     let (server, addr) = start(|c| c.server.unix_socket = Some(sock.to_string_lossy().into()));
     let mut tcp = Client::connect_tcp(&addr).unwrap();

@@ -36,9 +36,6 @@ fn config(dir: &PathBuf, durability: Durability) -> Config {
     cfg.storage.durability = durability;
     cfg.storage.data_dir = Some(dir.join("data").to_string_lossy().into());
     cfg.storage.snapshot_every_records = 50;
-    if std::env::var_os("SOLID_ENGINE_REACTOR_DIRECT").is_some() {
-        cfg.engine.shards = 1;
-    }
     cfg
 }
 
@@ -117,9 +114,6 @@ impl Daemon {
 
 #[test]
 fn sigkill_keeps_confirmed_pushes_and_fences_the_old_worker() {
-    if std::env::var_os("SOLID_ENGINE_REACTOR_DIRECT").is_some() {
-        return;
-    }
     let dir = temp_dir("sigkill");
     let daemon = Daemon::start(&dir);
     let mut c = daemon.client();

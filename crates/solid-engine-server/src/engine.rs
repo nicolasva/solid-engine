@@ -65,9 +65,65 @@ impl Notifier {
     }
 }
 
+/// Boîte aux lettres d'un shard possédé par un réacteur (mode direct) : le réacteur la vide à chaque tour.
+pub(crate) struct Mailbox {
+    queue: Mutex<Vec<Cmd>>,
+    capacity: usize,
+    wake_fd: std::sync::atomic::AtomicI32,
+}
+
+impl Mailbox {
+    fn new(capacity: usize) -> Self {
+        Self { queue: Mutex::new(Vec::new()), capacity, wake_fd: std::sync::atomic::AtomicI32::new(-1) }
+    }
+
+    pub(crate) fn set_wake_fd(&self, fd: i32) {
+        self.wake_fd.store(fd, Ordering::SeqCst);
+    }
+
+    fn push(&self, cmd: Cmd) -> std::result::Result<(), TrySendError<Cmd>> {
+        let mut q = self.queue.lock().unwrap();
+        if q.len() >= self.capacity {
+            return Err(TrySendError::Full(cmd));
+        }
+        let was_empty = q.is_empty();
+        q.push(cmd);
+        drop(q);
+        let fd = self.wake_fd.load(Ordering::SeqCst);
+        if was_empty && fd >= 0 {
+            extern "C" {
+                fn write(fd: i32, buf: *const std::ffi::c_void, n: usize) -> isize;
+            }
+            let one = 1u64.to_ne_bytes();
+            unsafe { write(fd, one.as_ptr().cast(), 8) };
+        }
+        Ok(())
+    }
+
+    /// Exécute les commandes reçues sur le shard ; renvoie vrai si un arrêt a été demandé.
+    pub(crate) fn apply(&self, shard: &mut Shard, pending: &mut Pending, failed: &Option<EngineError>, now: u64) -> bool {
+        let cmds = std::mem::take(&mut *self.queue.lock().unwrap());
+        cmds.into_iter().fold(false, |stop, cmd| apply_cmd(shard, pending, failed, cmd, now) || stop)
+    }
+}
+
+enum ShardTx {
+    Channel(SyncSender<Cmd>),
+    Mailbox(Arc<Mailbox>),
+}
+
+impl ShardTx {
+    fn try_send(&self, cmd: Cmd) -> std::result::Result<(), TrySendError<Cmd>> {
+        match self {
+            ShardTx::Channel(tx) => tx.try_send(cmd),
+            ShardTx::Mailbox(m) => m.push(cmd),
+        }
+    }
+}
+
 pub struct Engine {
     cfg: Arc<Config>,
-    shards: Vec<SyncSender<Cmd>>,
+    shards: Vec<ShardTx>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     notifier: Arc<Notifier>,
     next_claim_shard: AtomicUsize,
@@ -75,7 +131,7 @@ pub struct Engine {
     shutting_down: AtomicBool,
     lock: Mutex<Option<DataDirLock>>,
     /// Prototype Zero-Dispatch : shard 0 (et son WAL) confié au réacteur.
-    direct: Mutex<Option<(Shard, Option<Durable>)>>,
+    direct: Mutex<Vec<Option<(Shard, Option<Durable>, Arc<Mailbox>)>>>,
 }
 
 pub(crate) fn direct_enabled() -> bool {
@@ -95,13 +151,14 @@ impl Engine {
         let notifier = Arc::new(Notifier::default());
         let (mut senders, mut threads) = (Vec::new(), Vec::new());
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let mut direct = None;
+        let mut direct = Vec::new();
         let spawned = if direct_enabled() {
-            if cfg.engine.shards != 1 {
-                return Err("SOLID_ENGINE_REACTOR_DIRECT exige un seul shard".into());
+            for id in 0..cfg.engine.shards {
+                let (shard, durable) = open_shard(id, &cfg)?;
+                let mailbox = Arc::new(Mailbox::new(cfg.engine.mailbox_capacity));
+                senders.push(ShardTx::Mailbox(mailbox.clone()));
+                direct.push(Some((shard, durable, mailbox)));
             }
-            direct = Some(open_shard(0, &cfg)?);
-            senders.push(sync_channel(1).0);
             0
         } else {
             cfg.engine.shards
@@ -113,7 +170,7 @@ impl Engine {
                 .name(format!("shard-{id}"))
                 .spawn(move || shard_thread(id, c, rx, n, r))
                 .map_err(|e| e.to_string())?;
-            senders.push(tx);
+            senders.push(ShardTx::Channel(tx));
             threads.push(t);
         }
         drop(ready_tx);
@@ -138,8 +195,16 @@ impl Engine {
         }))
     }
 
-    pub(crate) fn take_direct(&self) -> Option<(Shard, Option<Durable>)> {
-        self.direct.lock().unwrap().take()
+    pub(crate) fn take_direct(&self, id: usize) -> Option<(Shard, Option<Durable>, Arc<Mailbox>)> {
+        self.direct.lock().unwrap().get_mut(id)?.take()
+    }
+
+    pub(crate) fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    pub(crate) fn notify_ready(&self) {
+        self.notifier.notify();
     }
 
     pub fn config(&self) -> &Config {
@@ -149,7 +214,7 @@ impl Engine {
     pub fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
         for s in &self.shards {
-            let _ = s.send(Cmd::Shutdown);
+            let _ = s.try_send(Cmd::Shutdown);
         }
         self.notifier.notify();
         for t in self.threads.lock().unwrap().drain(..) {
@@ -204,7 +269,7 @@ impl Engine {
         }
     }
 
-    fn push_shard(&self, req: &mut PushRequest) -> usize {
+    pub(crate) fn push_shard(&self, req: &mut PushRequest) -> usize {
         if req.job_id == 0 {
             req.job_id = self.generate_id();
         }
@@ -322,7 +387,7 @@ impl Engine {
     }
 
     /// Le shard propriétaire est encodé dans les 16 bits de poids fort du `reservation_id`.
-    fn reservation_shard(&self, r: &Reservation) -> Result<usize> {
+    pub(crate) fn reservation_shard(&self, r: &Reservation) -> Result<usize> {
         let shard = (r.reservation_id >> 48) as usize;
         if shard < self.shards.len() {
             Ok(shard)
@@ -782,6 +847,22 @@ pub(crate) fn flush(
     }
 }
 
+/// Applique une commande au shard ; renvoie vrai pour `Shutdown`.
+fn apply_cmd(shard: &mut Shard, pending: &mut Pending, failed: &Option<EngineError>, cmd: Cmd, now: u64) -> bool {
+    match cmd {
+        Cmd::Push(r, tx) => defer(pending, tx, shard.push(r, now)),
+        Cmd::Claim { channel_id, lease_ms, reply } => defer(pending, reply, shard.claim(channel_id, lease_ms, now)),
+        Cmd::Ack(r, tx) => defer(pending, tx, shard.ack(r, now)),
+        Cmd::Nack(r, k, tx) => defer(pending, tx, shard.nack(r, k, now)),
+        Cmd::Extend(r, ms, tx) => defer(pending, tx, shard.extend_lease(r, ms, now)),
+        Cmd::Cancel(id, tx) => defer(pending, tx, shard.cancel(id, now)),
+        Cmd::Get(id, tx) => reply_read(tx, failed, || shard.get(id, now)),
+        Cmd::Stats(ch, tx) => reply_read(tx, failed, || Ok(shard.stats(ch, now))),
+        Cmd::Shutdown => return true,
+    }
+    false
+}
+
 fn shard_thread(
     id: usize,
     cfg: Arc<Config>,
@@ -866,22 +947,9 @@ fn shard_thread(
         let mut next = first;
         let mut handled = 0;
         while let Some(cmd) = next {
-            let now = now_ms();
-            match cmd {
-                Cmd::Push(r, tx) => defer(&mut pending, tx, shard.push(r, now)),
-                Cmd::Claim { channel_id, lease_ms, reply } => {
-                    defer(&mut pending, reply, shard.claim(channel_id, lease_ms, now))
-                }
-                Cmd::Ack(r, tx) => defer(&mut pending, tx, shard.ack(r, now)),
-                Cmd::Nack(r, k, tx) => defer(&mut pending, tx, shard.nack(r, k, now)),
-                Cmd::Extend(r, ms, tx) => defer(&mut pending, tx, shard.extend_lease(r, ms, now)),
-                Cmd::Cancel(id, tx) => defer(&mut pending, tx, shard.cancel(id, now)),
-                Cmd::Get(id, tx) => reply_read(tx, &failed, || shard.get(id, now)),
-                Cmd::Stats(ch, tx) => reply_read(tx, &failed, || Ok(shard.stats(ch, now))),
-                Cmd::Shutdown => {
-                    stop = true;
-                    break;
-                }
+            if apply_cmd(&mut shard, &mut pending, &failed, cmd, now_ms()) {
+                stop = true;
+                break;
             }
             handled += 1;
             next = if handled < MAX_BATCH { rx.try_recv().ok() } else { None };

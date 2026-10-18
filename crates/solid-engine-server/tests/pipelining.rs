@@ -19,9 +19,6 @@ fn start(mode: Durability, max_connections: usize) -> (Server, String) {
     if mode != Durability::Memory {
         cfg.storage.data_dir = Some(dir.to_string_lossy().into());
     }
-    if std::env::var_os("SOLID_ENGINE_REACTOR_DIRECT").is_some() {
-        cfg.engine.shards = 1;
-    }
     let server = Server::start(cfg).unwrap();
     let addr = server.tcp_addr().unwrap().to_string();
     (server, addr)
