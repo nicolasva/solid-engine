@@ -3,7 +3,9 @@ name = "solid-engine-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description.workspace = true
+repository.workspace = true
 
 [dependencies]
-solid-engine-core = { path = "../solid-engine-core", default-features = false }
+solid-engine-core = { path = "../solid-engine-core", version = "1.0.0", default-features = false }
 crc32fast.workspace = true

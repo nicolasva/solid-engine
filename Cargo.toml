@@ -11,6 +11,9 @@ members = [
 version = "1.0.0"
 edition = "2021"
 license = "MIT"
+description = "Solid engine"
+repository = "https://github.com/nicolasva/solid-engine"
+readme = "readme.md"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
