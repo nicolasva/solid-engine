@@ -1,0 +1,17 @@
+[package]
+name = "solid-engine-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "solid_engine_server"
+
+[[bin]]
+name = "solid-engine-server"
+path = "src/bin/main.rs"
+
+[dependencies]
+solid-engine-core = { path = "../solid-engine-core" }
+solid-engine-protocol = { path = "../solid-engine-protocol" }
+solid-engine-storage = { path = "../solid-engine-storage" }

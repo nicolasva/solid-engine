@@ -1,0 +1,9 @@
+[package]
+name = "solid-engine-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+solid-engine-core = { path = "../solid-engine-core" }
+crc32fast.workspace = true

@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/solid-engine-core",
+    "crates/solid-engine-protocol",
+    "crates/solid-engine-storage",
+    "crates/solid-engine-server",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+crc32fast = "1"
