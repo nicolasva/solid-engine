@@ -8,12 +8,13 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 license = "MIT"
 description = "Solid engine"
 repository = "https://github.com/nicolasva/solid-engine"
-readme = "readme.md"
+keywords = ["jobs", "queue", "scheduler", "wal", "storage"]
+categories = ["database-implementations", "asynchronous"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

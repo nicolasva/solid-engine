@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description.workspace = true
 repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
 
 [lib]
 name = "solid_engine_server"
@@ -14,9 +17,9 @@ name = "solid-engine-server"
 path = "src/bin/main.rs"
 
 [dependencies]
-solid-engine-core = { path = "../solid-engine-core", version = "1.0.0", default-features = false }
-solid-engine-protocol = { path = "../solid-engine-protocol", version = "1.0.0" }
-solid-engine-storage = { path = "../solid-engine-storage", version = "1.0.0" }
+solid-engine-core = { path = "../solid-engine-core", version = "1.0.1", default-features = false }
+solid-engine-protocol = { path = "../solid-engine-protocol", version = "1.0.1" }
+solid-engine-storage = { path = "../solid-engine-storage", version = "1.0.1" }
 
 [features]
 default = ["split-done"]

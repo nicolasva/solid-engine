@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "solid-engine-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "serde",
  "toml",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "solid-engine-protocol"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "crc32fast",
  "solid-engine-core",
@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "solid-engine-server"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "solid-engine-core",
  "solid-engine-protocol",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "solid-engine-storage"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "crc32fast",
  "solid-engine-core",
