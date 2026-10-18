@@ -353,6 +353,18 @@ Rétrécissement : `shrink_to` ne réduit qu'une sous-table par `tick` (pour bor
 - Pistes (non implémentées) : `malloc_trim(0)` à la fin d'une réduction, ou fixer le seuil de mmap.
 - Non vérifié : l'arrêt du serveur pendant une réduction en attente.
 
+
+**Correctif `malloc_trim(0)`** : quand la réduction de `done` se termine (`take_shrink_finished`), le shard appelle `malloc_trim(0)` (glibc uniquement). Mesure, 4 cycles dans le même processus (1 M de jobs, 75 s sans commande) :
+
+| Cycle | RSS après remplissage | RSS après purge |
+|---|---|---|
+| 1 | 113,8 Mo | 5,6 Mo |
+| 2 | 126,2 Mo | 5,7 Mo |
+| 3 | 126,2 Mo | 17,2 Mo |
+| 4 | 129,2 Mo | 7,2 Mo |
+
+Le RSS au repos ne dérive plus (5–17 Mo, contre 38–62 Mo sans trim). Un seul `malloc_trim` par fin de réduction, hors chemin chaud. Réserve : 4 cycles, Docker Desktop ; l'arrêt du serveur pendant une réduction en attente n'est pas testé.
+
 ### Linux (Docker Desktop), topologie CPU, Redis Lua et réacteur expérimental
 
 Environnement : conteneur `rust:1-bookworm` dans Docker Desktop (VM LinuxKit, 12 CPU partagés avec macOS), mode Memory, affinité de claim A2, générateur épinglé sur les CPU 0–5, serveur sur les CPU 6–7 (`taskset`). Médianes de 3 passes entrelacées. Le CPU est celui du processus serveur (`/proc`). Scripts : `benchmark_solid_engine/scripts/` (`pin_server.sh`, `pin_redis.sh`, `campaign_redis.sh`, `thread_cpu.py`, `perf_attach.sh`).
