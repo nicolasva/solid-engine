@@ -10,7 +10,7 @@ members = [
 [workspace.package]
 version = "1.0.1"
 edition = "2021"
-license = "MIT"
+license = "LGPL-3.0-or-later"
 description = "Solid engine"
 repository = "https://github.com/nicolasva/solid-engine"
 keywords = ["jobs", "queue", "scheduler", "wal", "storage"]
