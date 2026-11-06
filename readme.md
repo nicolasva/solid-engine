@@ -552,3 +552,29 @@ RSS direct (50 k jobs/s, 8×8, 4 shards, rétention 60 s, 3 passes) :
 | 1 M | 172,5–172,6 Mo | 155,5–157,4 Mo | 16,1 Mo |
 
 Gain ≈ −9 % à 1 M de jobs (≈ 157 octets par job retenu) : bien inférieur à une disparition des 172 Mo, la table `Done` et ses jeux de capacité restant. Débit tenu à 50 k jobs/s ; p99 ≈ 3,5 ms inchangé ; CPU/job 23,6–28,8 µs (contre 22,7–25,9 avant) : écart possiblement du bruit, non tranché sans passes avant/après entrelacées. SolidEngine reste ≈ 10× Redis avec la rétention par défaut. Piste suivante, seulement si on poursuit : table à adressage ouvert pour `Done`.
+
+### Défauts réseau : affinité de claim et `yield` du writer (macOS, multi-connexions)
+
+`SOLID_ENGINE_CLAIM_AFFINITY` et `SOLID_ENGINE_WRITER_YIELD` sont désormais **actifs par défaut** (`=0` pour les désactiver). Mesure (macOS arm64, 4 shards, Memory, `BENCH_PARTITION=1`, fenêtre 8, 60 000 jobs, médiane de 3) :
+
+| workers | Redis Lua | avant | après |
+|---:|---:|---:|---:|
+| 1 | 40 340 | 10–14 k (readme historique, fenêtre 1) | 62 417 |
+| 8 | 59 813 | 48 485 | 67 034 (+12 %) |
+| 32 | 60 849 | 39 878–43 858 | 51 359 (−16 %) |
+
+Réserves : SolidEngine reste derrière Redis Lua à 32 workers (64 threads lecteur/écrivain sur 12 CPU, `sys` ≈ 70 µs/job contre ≈ 3 pour Redis) ; un seul run de comparaison par configuration, un client commun limite probablement les deux cibles autour de 60 k jobs/s.
+
+### Relance Redis / Redis Lua / SolidEngine (macOS arm64, 4 shards, fenêtre 8)
+
+Défauts actuels : affinité de claim, `yield` du writer et attente active des shards de 100 µs (`SOLID_ENGINE_SPIN_SHARD_US`, `0` pour la désactiver ; adaptative, elle se coupe après des échecs). `BENCH_SHARDS=4 BENCH_PARTITION=1`, 60 000 jobs, 256 B, médiane de 5 runs. Redis sans persistance ; `redis` = schéma simplifié (LPUSH/RPOPLPUSH/LREM), `redis-lua` = scripts atomiques (lease, fencing).
+
+| workers | redis | redis-lua | SE memory | SE balanced |
+|---:|---:|---:|---:|---:|
+| 1 | 92 046 | 41 216 | 61 754 (+50 %) | 60 172 (+46 %) |
+| 8 | 226 390 | 58 790 | 71 984 (+22 %) | 82 979 (+41 %) |
+| 32 | 244 526 | 59 917 | 62 040 (+4 %) | 93 110 (+55 %) |
+
+Les pourcentages sont relatifs à redis-lua. Avant l'attente active (campagne précédente) : memory 57 976 / 67 351 / 50 526, balanced 60 415 / 76 886 / 76 091 ; memory à 32 workers était à −18 % car, plus rapide que balanced, le shard se rendormait à chaque commande (réveils, `sys` ≈ 71 µs/job).
+
+Coût : CPU/job à 8 workers, usr 49 µs (memory) contre ≈ 14 pour redis-lua, sys 38–42 contre ≈ 3 ; le CPU total par job est donc **nettement supérieur** à Redis. Le `+4 %` de memory à 32 workers est dans le bruit. Face au Redis simplifié (sans leases ni fencing), SolidEngine reste derrière (×0,25 à ×0,7). Réserves : variabilité entre runs de 10 % ou plus, coût CPU au repos de l'attente active non mesuré, pas de Linux natif.

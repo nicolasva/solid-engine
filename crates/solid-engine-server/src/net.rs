@@ -260,7 +260,7 @@ fn serve_connection<R: Read, W: Write + Send + 'static>(
         // Toutes les réponses déjà prêtes partent dans un seul write.
         let mut gate = crate::engine::SpinGate::default();
         let mut tally = crate::stats::Tally::default().with_cpu_role(crate::stats::C::CpuWriterNs);
-        let yield_once = std::env::var_os("SOLID_ENGINE_WRITER_YIELD").is_some();
+        let yield_once = std::env::var("SOLID_ENGINE_WRITER_YIELD").map_or(true, |v| v != "0");
         let linger_us = crate::engine::writer_linger_us();
         let mut linger_gate = crate::engine::SpinGate::default();
         loop {

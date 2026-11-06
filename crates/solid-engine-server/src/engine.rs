@@ -488,7 +488,7 @@ const MAX_BATCH: usize = 256;
 /// Expérimental : une connexion commence ses claims par le shard de son dernier push.
 pub(crate) fn claim_affinity() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("SOLID_ENGINE_CLAIM_AFFINITY").is_some())
+    *V.get_or_init(|| std::env::var("SOLID_ENGINE_CLAIM_AFFINITY").map_or(true, |v| v != "0"))
 }
 
 pub(crate) const MAX_SPIN_US: u64 = 100;
@@ -518,7 +518,7 @@ fn env_spin_us(name: &str) -> u64 {
 /// Durée d'attente active d'un shard avant de dormir (lue une seule fois).
 fn shard_spin_us() -> u64 {
     static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_spin_us("SOLID_ENGINE_SPIN_SHARD_US"))
+    *V.get_or_init(|| parse_spin_us("SOLID_ENGINE_SPIN_SHARD_US", std::env::var("SOLID_ENGINE_SPIN_SHARD_US").ok().as_deref(), MAX_SPIN_US))
 }
 
 /// Idem pour l'écrivain de réponses d'une connexion.
