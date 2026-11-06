@@ -17,9 +17,9 @@ name = "solid-engine-server"
 path = "src/bin/main.rs"
 
 [dependencies]
-solid-engine-core = { path = "../solid-engine-core", version = "1.0.1", default-features = false }
-solid-engine-protocol = { path = "../solid-engine-protocol", version = "1.0.1" }
-solid-engine-storage = { path = "../solid-engine-storage", version = "1.0.1" }
+solid-engine-core = { path = "../solid-engine-core", version = "1.1.0", default-features = false }
+solid-engine-protocol = { path = "../solid-engine-protocol", version = "1.1.0" }
+solid-engine-storage = { path = "../solid-engine-storage", version = "1.1.0" }
 
 [features]
 default = ["split-done"]
