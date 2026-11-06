@@ -77,6 +77,7 @@ impl Mailbox {
         Self { queue: Mutex::new(Vec::new()), capacity, wake_fd: std::sync::atomic::AtomicI32::new(-1) }
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn set_wake_fd(&self, fd: i32) {
         self.wake_fd.store(fd, Ordering::SeqCst);
     }
@@ -101,6 +102,7 @@ impl Mailbox {
     }
 
     /// Exécute les commandes reçues sur le shard ; renvoie vrai si un arrêt a été demandé.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn apply(&self, shard: &mut Shard, pending: &mut Pending, failed: &Option<EngineError>, now: u64) -> bool {
         let cmds = std::mem::take(&mut *self.queue.lock().unwrap());
         cmds.into_iter().fold(false, |stop, cmd| apply_cmd(shard, pending, failed, cmd, now) || stop)
@@ -131,6 +133,7 @@ pub struct Engine {
     shutting_down: AtomicBool,
     lock: Mutex<Option<DataDirLock>>,
     /// Prototype Zero-Dispatch : shard 0 (et son WAL) confié au réacteur.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     direct: Mutex<Vec<Option<(Shard, Option<Durable>, Arc<Mailbox>)>>>,
 }
 
@@ -195,14 +198,17 @@ impl Engine {
         }))
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn take_direct(&self, id: usize) -> Option<(Shard, Option<Durable>, Arc<Mailbox>)> {
         self.direct.lock().unwrap().get_mut(id)?.take()
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn shard_count(&self) -> usize {
         self.shards.len()
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn notify_ready(&self) {
         self.notifier.notify();
     }
@@ -762,6 +768,7 @@ fn open_shard(id: usize, cfg: &Arc<Config>) -> std::result::Result<(Shard, Optio
     Ok((shard, Some(Durable { wal, writer, mode, since_snapshot })))
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn close_durable(d: Durable) {
     if let Some(mut wal) = d.wal {
         let _ = wal.sync();
