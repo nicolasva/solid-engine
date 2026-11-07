@@ -110,22 +110,32 @@ Fenêtre de production de 1000 jobs par aller-retour pour tous ; Redis sans pers
 
 Enseignements : (1) les benchmarks de 40 000 jobs étaient dominés par le démarrage ; (2) avec une fenêtre de production de 64, les `Dispatch` ne contenaient en moyenne que 15 à 25 jobs et le banc plafonnait à ≈ 300 k à 1 worker ; (3) le lecteur du serveur attendait l'`AckBatch` avant de lire le `Credit` suivant : le traitement asynchrone a fait passer 1 worker de 297 k à 411 k ; (4) le moteur seul (`examples/engine_batch.rs`, sans réseau, 1 shard, lots de 100) fait ≈ 590 k jobs/s : le plafond vient du chemin réseau, pas des shards. Redis reste devant à 1 worker (≈ 79 %) et à parité à 8 workers (≈ 97 %), mais sans durabilité ni leases ni fencing.
 
-### Où se trouve le plafond à 1 worker (même environnement ; chaque tableau compare des runs d'un même binaire du banc)
+### Balanced avec snapshots contre Redis (Linux, Docker, 12 CPU, campagne `camp10`)
 
-- **Le plafond de ≈ 400 k n'est pas dans le moteur.** Le dispatcher passe ≈ 94 % de son temps dans la réservation, mais le temps par job reste ≈ 2,35 µs quelle que soit la stratégie : copies du payload (C, D), nombre de shards (1 à 8), crédits au-delà de 256, réservation parallèle sur les shards (`SOLID_ENGINE_CLAIM_FANOUT=1`, aucun gain, désactivé). `SOLID_ENGINE_DISPATCH_TRACE=<fichier>` écrit les temps du dispatcher et les latences des `ClaimDispatch` (attente en file moyenne 25 µs, exécution 11,6 µs).
-- **Le producteur du banc limite.** `BENCH_PRODUCERS=N` (connexions de production par worker), fenêtre totale 1000 constante, Hyperlane 256 crédits, 1 worker :
+4 shards, 2 M de jobs, 256 B, 256 crédits, 1 worker, fenêtre de production totale 1000 (`BENCH_PRODUCERS=N`, fenêtre 1000/N par producteur), 3 runs alternés par configuration, sans instrumentation. SolidEngine en **balanced, WAL et snapshots actifs** ; Redis **sans persistance** dans ce banc (LPUSH/RPOPLPUSH/LREM, cycle complet sur chaque connexion). Valeurs individuelles en jobs/s :
 
-| Producteurs | memory | balanced | strict |
-|---|---:|---:|---:|
-| 1 | ≈ 357 k | ≈ 314 k | ≈ 121 k |
-| 2 | ≈ 556 k | ≈ 462 k | ≈ 137 k |
-| 4 | ≈ 534 k | — | — |
-| 8 | ≈ 491 k | — | — |
+| Config | Run 1 | Run 2 | Run 3 | Moyenne |
+|---|---:|---:|---:|---:|
+| Redis, 1 connexion | 526 468 | 536 233 | 497 067 | 520 k |
+| Hyperlane balanced, 1 producteur | 591 694 | 540 588 | 546 849 | 560 k |
+| Redis, 2 connexions | 534 262 | 528 447 | 543 097 | 535 k |
+| Hyperlane balanced, 2 producteurs | 538 123 | 503 984 | 546 521 | 530 k |
 
-- **Backlog préchargé** (`BENCH_PRELOAD=1`, seule la consommation est chronométrée, ACK inclus) : 858 k à 956 k jobs/s. Ce n'est pas un débit de bout en bout.
-- **Redis à nombre de connexions égal** (fenêtre 1000 par connexion, sans persistance) : 1 connexion ≈ 521 k, 2 ≈ 555 k, 3 ≈ 568 k ; Hyperlane 2 producteurs + 1 consommateur (3 connexions) ≈ 556 k. Parité approximative (≈ 97–99 %), pas de dépassement démontré. Le banc Redis fait tout le cycle sur une seule connexion : il n'y a pas d'équivalent exact à « plusieurs producteurs ».
-- **Biais connu du banc.** Le même banc, sans `BENCH_PRODUCERS`, donne ≈ 403 k à 1 producteur, contre ≈ 357 k avec le code actuel (10 à 12 % de moins, reproductible sur des runs alternés). Le serveur et la logique de production sont identiques ; la cause n'est pas élucidée (hypothèse : génération de code de la boucle de consommation du client, qui est le thread le plus chargé, ≈ 95 % d'un cœur). Un écart de cette taille causé par du code client confirme que le banc, et pas le moteur, limite les mesures à 1 producteur. Ne comparer entre eux que des runs d'un même binaire.
-- **strict** est limité par la durabilité (fsync), pas par la production ; les fsync n'ont pas encore été mesurés. Redis sans persistance n'est comparable à aucun des modes balanced ou strict.
+Lecture : à 1 producteur, balanced est devant Redis dans les 3 paires (+7,7 % en moyenne, ≈ +5 % sans le run à 592 k, au niveau du bruit) ; à 2 producteurs, c'est une parité (−1,1 %, 2 runs sur 3 devant). Le bruit par run atteint ±10 %. **Ce n'est pas une équivalence de garanties** (Redis sans durabilité, protocoles différents) : ces chiffres comparent le débit d'un scénario précis, pas deux systèmes équivalents. `memory` fait ≈ 515 k (1 producteur) et ≈ 538 k (2) dans la campagne `camp9` ; `strict` n'a pas été remesuré (plafond fsync).
+
+Ce qui a changé le chemin balanced à plusieurs producteurs (comparaisons appariées, même binaire, 3 runs alternés) :
+
+- **Snapshots écrits par le thread WAL.** Le shard encodait l'état puis attendait l'écriture et le `sync_all` du snapshot (40 à 110 ms) : stalls de plus de 10 ms par fenêtre de production. Le shard envoie maintenant l'état encodé dans la file FIFO du WAL sans attendre ; le WAL le rattache à la séquence exacte et publie, tourne et supprime en sécurité. Balanced 2 producteurs : 334 k → 477 k. L'encodage reste sur le shard (10–15 ms par snapshot). Récupération testée par états intermédiaires simulés (`crash_between_snapshot_steps_recovers_exactly`) et redémarrages ; **pas de test de coupure réelle (SIGKILL) pendant l'E/S du snapshot**.
+- **Encodage des réponses sur le thread writer** (défaut ; `SOLID_ENGINE_WRITER_ENCODE=0` rétablit l'encodage dans le callback du shard). L'encodage de la trame coûtait ≈ 1,3 µs par commande sur le thread du shard. Balanced : 1 producteur 498 k → 519 k (+4 %), 2 producteurs 445 k → 534 k (+20 %) ; 12 paires sur 12 favorables, puis 450 k → 530 k dans `camp10`.
+- **Résultats négatifs :** Fusion, réservation parallèle sur les shards (`SOLID_ENGINE_CLAIM_FANOUT`), pré-allocation du tampon de snapshot (aucun gain).
+
+Limites connues :
+
+- **La file de réponses du writer n'est pas bornée**, avant comme après le changement : `in_flight` est libéré dès l'envoi dans la file, donc un client qui n'envoie que sans lire fait grossir la mémoire du serveur (≈ +120 Mo pour 300 000 réponses). Le test `slow_client` vérifie que toutes les réponses reviennent une fois, sans fuite après déconnexion ; une limite par connexion reste à concevoir.
+- **Stall intermittent d'environ 3,6 s** au vidage après une longue pause de lecture (1 run sur 10 dans chaque variante), cause inconnue.
+- Mesures Linux sous Docker uniquement ; macOS non retesté après ces changements.
+
+Diagnostics : `SOLID_ENGINE_DISPATCH_TRACE=<fichier>` écrit les temps du dispatcher, du WAL (profondeur de file, fsync, snapshots) et des phases des shards (attente, `apply`, journalisation, réponses). Backlog préchargé (`BENCH_PRELOAD=1`, consommation seule) : 858 k à 956 k jobs/s, ce n'est pas un débit de bout en bout. Ne comparer entre eux que des runs d'un même binaire du banc.
 
 ## Benchmark (phase 5)
 
