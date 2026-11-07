@@ -254,8 +254,8 @@ fn accept_loop<R, W>(
 /// Requêtes asynchrones simultanément en vol par connexion (backpressure de la lecture).
 const MAX_IN_FLIGHT: usize = 256;
 
-/// Réponse en file pour le writer : encodée par le callback (défaut) ou, avec
-/// `SOLID_ENGINE_WRITER_ENCODE=1`, par le thread writer pour décharger les shards.
+/// Réponse en file pour le writer : encodée par le thread writer (défaut), ce qui décharge les shards, ou, avec
+/// `SOLID_ENGINE_WRITER_ENCODE=0`, par le callback qui la libère (ancien comportement).
 enum OutMsg {
     Frame(Frame),
     Resp(Response, u8, u64),
@@ -281,7 +281,7 @@ impl Out {
     fn send_resp(&self, r: Response, ty: u8, id: u64) {
         static WRITER_ENCODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let msg = if *WRITER_ENCODE
-            .get_or_init(|| std::env::var("SOLID_ENGINE_WRITER_ENCODE").is_ok_and(|v| v == "1"))
+            .get_or_init(|| std::env::var("SOLID_ENGINE_WRITER_ENCODE").map_or(true, |v| v != "0"))
         {
             OutMsg::Resp(r, ty, id)
         } else {
