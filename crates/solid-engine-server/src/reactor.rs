@@ -6,14 +6,14 @@
 
 use crate::engine::Engine;
 use solid_engine_core::*;
-use solid_engine_protocol::{read_frame, write_frame, Frame, ProtocolError, Request, Response, HEADER_LEN};
+use solid_engine_protocol::{msg, read_frame, write_frame, Frame, ProtocolError, Request, Response, HEADER_LEN};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 const MAX_IN_FLIGHT: usize = 256;
@@ -132,7 +132,29 @@ struct Conn {
     last_push_shard: Option<usize>,
     claims: u32,
     authed: bool,
+    sub: Option<Sub>,
 }
+
+/// Abonnement Hyperlane d'une connexion : le réacteur pousse des jobs dans la limite des crédits.
+struct Sub {
+    channel_id: u16,
+    lease_ms: u32,
+    rid: u64,
+    st: Arc<SubState>,
+}
+
+/// État partagé avec les callbacks des autres shards (réservations distantes).
+struct SubState {
+    credits: AtomicU64,
+    remote_busy: AtomicBool,
+    remote_empty: AtomicBool,
+    remote_gen: AtomicU64,
+    retry_at: AtomicU64,
+}
+
+const DISPATCH_MAX: u64 = 256;
+const DISPATCH_MAX_BYTES: usize = 256 * 1024;
+const REMOTE_RETRY_MS: u64 = 50;
 
 struct Reactor {
     ep: i32,
@@ -150,6 +172,10 @@ struct Reactor {
     direct: Option<std::cell::RefCell<Direct>>,
     /// Mode direct avec plusieurs shards : les commandes d'un autre shard passent par sa boîte aux lettres.
     multi: bool,
+    /// Connexions abonnées (tourniquet pour l'équité) et drapeau de réveil par le notifier du moteur.
+    subs: std::cell::RefCell<Vec<u64>>,
+    sub_rr: usize,
+    hungry: Arc<AtomicBool>,
 }
 
 /// Transport d'une connexion : TCP ou socket Unix (même traitement des commandes).
@@ -222,6 +248,10 @@ pub fn start(
         let shared = Arc::new(Shared { efd, responses: Mutex::new(Vec::new()), new_conns: Mutex::new(Vec::new()) });
         let mut ev = EpollEvent { events: EPOLLIN, data: WAKE_ID };
         unsafe { epoll_ctl(ep, CTL_ADD, efd, &mut ev) };
+        let hungry = Arc::new(AtomicBool::new(false));
+        if crate::engine::direct_enabled() && engine.shard_count() > 1 {
+            engine.register_waker(hungry.clone(), efd);
+        }
         let r = Reactor {
             ep,
             shared: shared.clone(),
@@ -235,9 +265,20 @@ pub fn start(
             prof: Prof::new(),
             direct: direct_shard(engine, n, index, &shared),
             multi: engine.shard_count() > 1,
+            subs: Default::default(),
+            sub_rr: 0,
+            hungry,
             drain_us: std::env::var("SOLID_ENGINE_REACTOR_DRAIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         };
-        threads.push(std::thread::Builder::new().name("se-reactor".into()).spawn(move || r.run()).unwrap());
+        threads.push(
+            std::thread::Builder::new()
+                .name("se-reactor".into())
+                .spawn(move || {
+                    pin_to_core(index);
+                    r.run()
+                })
+                .unwrap(),
+        );
         handles.push(Handle { shared, next_id: Arc::new(AtomicU64::new(0)) });
     }
     (handles, threads)
@@ -310,7 +351,9 @@ impl Reactor {
                 for (cid, frame) in batch {
                     if let Some(c) = self.conns.get_mut(&cid) {
                         let _ = write_frame(&mut c.out, &frame);
-                        c.inflight = c.inflight.saturating_sub(1);
+                        if frame.msg_type != msg::DISPATCH {
+                            c.inflight = c.inflight.saturating_sub(1);
+                        }
                         if touched.last() != Some(&cid) {
                             touched.push(cid);
                         }
@@ -350,8 +393,9 @@ impl Reactor {
         }
     }
 
-    fn direct_flush(&self) {
+    fn direct_flush(&mut self) {
         let mut d = self.direct.as_ref().unwrap().borrow_mut();
+        let index = d.index;
         let Direct { shard, durable, failed, pending, waiters, mailbox, .. } = &mut *d;
         let now = now_ms();
         mailbox.apply(shard, pending, failed, now);
@@ -369,6 +413,20 @@ impl Reactor {
         });
         if !waiters.is_empty() {
             self.serve_waiters(shard, pending, failed, waiters, now);
+        }
+        if !self.subs.get_mut().is_empty() {
+            let (shared, engine, multi) = (&self.shared, &self.engine, self.multi);
+            dispatch_subs(
+                &mut self.conns,
+                self.subs.get_mut(),
+                &mut self.sub_rr,
+                &self.hungry,
+                (shared, engine, multi, index),
+                shard,
+                pending,
+                failed,
+                now,
+            );
         }
         IN_REACTOR_FLUSH.with(|f| f.set(Arc::as_ptr(&self.shared) as usize));
         crate::engine::flush(shard, durable, failed, pending, self.engine.config());
@@ -397,7 +455,9 @@ impl Reactor {
             } else {
                 match w.lease_ms {
                     Some(lease) => match shard.claim(w.channel_id, lease, now) {
+                        Ok(Some(job)) if w.ty == solid_engine_protocol::msg::CLAIM_BATCH => Some(Response::ClaimBatch(vec![job])),
                         Ok(Some(job)) => Some(Response::Claim(Some(job))),
+                        Ok(None) if now >= w.deadline && w.ty == solid_engine_protocol::msg::CLAIM_BATCH => Some(Response::ClaimBatch(Vec::new())),
                         Ok(None) if now >= w.deadline => Some(Response::Claim(None)),
                         Ok(None) => None,
                         Err(e) => Some(Response::Error(e)),
@@ -447,6 +507,7 @@ impl Reactor {
                     last_push_shard: None,
                     claims: 0,
                     authed: !needs_auth,
+                    sub: None,
                 },
             );
         }
@@ -458,6 +519,9 @@ impl Reactor {
             self.live.fetch_sub(1, Ordering::SeqCst);
             if let Some(d) = &self.direct {
                 d.borrow_mut().waiters.retain(|w| w.conn != id);
+            }
+            if c.sub.is_some() {
+                self.subs.get_mut().retain(|&s| s != id);
             }
         }
     }
@@ -557,6 +621,45 @@ impl Reactor {
             c.closing |= close;
             return;
         }
+        if let (Some(_), Ok(req)) = (&self.direct, &decoded) {
+            match req {
+                Request::Subscribe { channel_id, lease_ms, credits } => {
+                    let resp = if c.sub.is_some() {
+                        Response::Error(EngineError::new(ErrorCode::BadRequest, "already subscribed"))
+                    } else {
+                        c.sub = Some(Sub {
+                            channel_id: *channel_id,
+                            lease_ms: *lease_ms,
+                            rid,
+                            st: Arc::new(SubState {
+                                credits: AtomicU64::new(*credits as u64),
+                                remote_busy: AtomicBool::new(false),
+                                remote_empty: AtomicBool::new(false),
+                                remote_gen: AtomicU64::new(0),
+                                retry_at: AtomicU64::new(0),
+                            }),
+                        });
+                        self.subs.borrow_mut().push(id);
+                        Response::Subscribed
+                    };
+                    let _ = write_frame(&mut c.out, &resp.to_frame(ty, rid));
+                    return;
+                }
+                Request::Credit { credits } => {
+                    match &c.sub {
+                        Some(s) => {
+                            s.st.credits.fetch_add(*credits as u64, Ordering::AcqRel);
+                        }
+                        None => {
+                            let e = EngineError::new(ErrorCode::BadRequest, "not subscribed");
+                            let _ = write_frame(&mut c.out, &Response::Error(e).to_frame(ty, rid));
+                        }
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         let t = self.prof.now();
         if let (Some(d), Ok(req), false) = (&self.direct, &decoded, self.multi) {
             let mut d = d.borrow_mut();
@@ -572,6 +675,20 @@ impl Reactor {
                     }
                     to_response(shard.push(p, now).map(Response::Push))
                 }
+                Request::PushBatch(ps) => match crate::net::push_batch_too_large(ps.len()) {
+                    Some(e) => Response::Error(e),
+                    None => Response::PushBatch(
+                        ps.into_iter()
+                            .map(|mut p| {
+                                if p.job_id == 0 {
+                                    *next_id += 1;
+                                    p.job_id = *next_id;
+                                }
+                                shard.push(p, now)
+                            })
+                            .collect(),
+                    ),
+                },
                 Request::AckJob(r) => to_response(shard.ack(r, now).map(|_| Response::Ack)),
                 Request::NackJob { reservation, kind } => to_response(shard.nack(reservation, kind, now).map(|_| Response::Nack)),
                 Request::ExtendLease { reservation, lease_ms } => {
@@ -606,6 +723,39 @@ impl Reactor {
                     }
                     Response::Wait { available }
                 }
+                Request::ClaimBatch { channel_id, lease_ms, max, wait_ms } => {
+                    let max = max.min(crate::net::MAX_BATCH) as usize;
+                    let mut jobs = Vec::with_capacity(max.min(64));
+                    let mut error = None;
+                    while jobs.len() < max {
+                        match shard.claim(channel_id, lease_ms, now) {
+                            Ok(Some(job)) => jobs.push(job),
+                            Ok(None) => break,
+                            Err(e) => {
+                                error = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    match error {
+                        Some(e) if jobs.is_empty() => Response::Error(e),
+                        _ if jobs.is_empty() && max > 0 && wait_ms > 0 => {
+                            c.inflight += 1;
+                            let deadline = now + wait_ms as u64;
+                            waiters.push(Waiter { conn: id, ty, rid, channel_id, lease_ms: Some(lease_ms), deadline });
+                            self.prof.add(3, t);
+                            return;
+                        }
+                        _ => Response::ClaimBatch(jobs),
+                    }
+                }
+                Request::AckBatch(rs) => {
+                    let n = rs.len().min(crate::net::MAX_BATCH as usize);
+                    Response::AckBatch(rs.into_iter().take(n).map(|r| shard.ack(r, now).err()).collect())
+                }
+                Request::Subscribe { .. } | Request::Credit { .. } => {
+                    Response::Error(EngineError::new(ErrorCode::BadRequest, "subscriptions are not supported by the epoll reactor"))
+                }
             };
             c.inflight += 1;
             let shared = self.shared.clone();
@@ -633,6 +783,7 @@ impl Reactor {
                 }
                 c.last_push_shard = Some(shard);
             }
+            Ok(Request::AckBatch(rs)) if self.direct.is_some() => self.ack_batch(c, id, ty, rid, rs),
             Ok(Request::AckJob(r)) if self.owns(&r) => {
                 {
                 self.run_local(c, id, ty, rid, |sh, now| Some(to_response(sh.ack(r, now).map(|_| Response::Ack))));
@@ -695,6 +846,80 @@ impl Reactor {
             }
         }
         self.prof.add(3, t);
+    }
+
+    /// ACK groupés en mode multi-shards : ceux du shard local sont appliqués sur place, les autres partent
+    /// en une commande par shard ; une seule réponse, une fois chaque partie durable.
+    fn ack_batch(&self, c: &mut Conn, id: u64, ty: u8, rid: u64, rs: Vec<Reservation>) {
+        let n = rs.len().min(crate::net::MAX_BATCH as usize);
+        let me = self.index();
+        let (mut results, mut local, mut remote_idx, mut remote) = (vec![None; n], Vec::new(), Vec::new(), Vec::new());
+        {
+            let mut d = self.direct.as_ref().unwrap().borrow_mut();
+            let now = now_ms();
+            for (i, r) in rs.into_iter().take(n).enumerate() {
+                if self.engine.reservation_shard(&r).is_ok_and(|s| s == me) {
+                    results[i] = d.shard.ack(r, now).err();
+                    local.push(i);
+                } else {
+                    remote_idx.push(i);
+                    remote.push(r);
+                }
+            }
+        }
+        c.inflight += 1;
+        let shared = self.shared.clone();
+        let parts = usize::from(!local.is_empty()) + usize::from(!remote.is_empty());
+        if parts <= 1 && remote.is_empty() {
+            let mut d = self.direct.as_ref().unwrap().borrow_mut();
+            d.pending.push(Box::new(move |failure| {
+                let resp = match failure {
+                    Some(e) => Response::AckBatch(vec![Some(e.clone()); n]),
+                    None => Response::AckBatch(results),
+                };
+                shared.respond(id, resp.to_frame(ty, rid));
+            }));
+            return;
+        }
+        let join = Arc::new(Mutex::new((results, parts)));
+        let finish = {
+            let (join, shared) = (join.clone(), shared.clone());
+            move |apply: Box<dyn FnOnce(&mut Vec<Option<EngineError>>)>| {
+                let mut j = join.lock().unwrap();
+                apply(&mut j.0);
+                j.1 -= 1;
+                if j.1 == 0 {
+                    let results = std::mem::take(&mut j.0);
+                    drop(j);
+                    shared.respond(id, Response::AckBatch(results).to_frame(ty, rid));
+                }
+            }
+        };
+        let finish = Arc::new(Mutex::new(Some(finish)));
+        if !local.is_empty() {
+            let finish = finish.clone();
+            let mut d = self.direct.as_ref().unwrap().borrow_mut();
+            d.pending.push(Box::new(move |failure| {
+                let failure = failure.cloned();
+                let f = finish.lock().unwrap();
+                f.as_ref().unwrap()(Box::new(move |res| {
+                    if let Some(e) = failure {
+                        for i in local {
+                            res[i] = Some(e.clone());
+                        }
+                    }
+                }));
+            }));
+        }
+        let finish = finish.clone();
+        self.engine.ack_many_async(remote, move |per_job| {
+            let f = finish.lock().unwrap();
+            f.as_ref().unwrap()(Box::new(move |res| {
+                for (i, r) in remote_idx.into_iter().zip(per_job) {
+                    res[i] = r;
+                }
+            }));
+        });
     }
 
     fn index(&self) -> usize {
@@ -824,6 +1049,131 @@ fn direct_shard(engine: &Arc<Engine>, reactors: usize, index: usize, shared: &Sh
 thread_local! {
     /// Adresse du `Shared` du réacteur pendant son `flush` : ses réponses sont relevées juste après, sans réveil.
     static IN_REACTOR_FLUSH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Envoie une trame `Dispatch` déjà encodée ; elle part après la durabilité.
+fn queue_frame(body: solid_engine_protocol::DispatchBody, conn: u64, rid: u64, pending: &mut crate::engine::Pending, shared: &Arc<Shared>) {
+    let frame = body.into_frame(rid);
+    let shared = shared.clone();
+    pending.push(Box::new(move |failure| {
+        let frame = match failure {
+            Some(e) => Response::Error(e.clone()).to_frame(msg::DISPATCH, rid),
+            None => frame,
+        };
+        shared.respond(conn, frame);
+    }));
+}
+
+/// Fusion : à chaque tour, chaque abonné reçoit des jobs du shard local (un seul passage par lot) ; si le
+/// shard local est à sec et que d'autres shards existent, une réservation asynchrone groupée les sollicite.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_subs(
+    conns: &mut HashMap<u64, Conn>,
+    subs: &mut [u64],
+    rr: &mut usize,
+    hungry: &Arc<AtomicBool>,
+    (shared, engine, multi, index): (&Arc<Shared>, &Arc<Engine>, bool, usize),
+    shard: &mut solid_engine_core::shard::Shard,
+    pending: &mut crate::engine::Pending,
+    failed: &Option<EngineError>,
+    now: u64,
+) {
+    let len = subs.len();
+    *rr = (*rr + 1) % len.max(1);
+    for k in 0..len {
+        let id = subs[(*rr + k) % len];
+        let Some(c) = conns.get_mut(&id) else { continue };
+        let Some(sub) = &c.sub else { continue };
+        if c.closing {
+            continue;
+        }
+        let (st, channel_id, lease_ms, rid) = (sub.st.clone(), sub.channel_id, sub.lease_ms, sub.rid);
+        let credits = st.credits.load(Ordering::Acquire);
+        if credits == 0 {
+            continue;
+        }
+        if let Some(e) = failed {
+            let frame = Response::Error(e.clone()).to_frame(msg::DISPATCH, rid);
+            let _ = write_frame(&mut c.out, &frame);
+            c.closing = true;
+            continue;
+        }
+        let want = credits.min(DISPATCH_MAX) as usize;
+        let mut got = 0u64;
+        let mut body = solid_engine_protocol::DispatchBody::new();
+        while (got as usize) < want {
+            match shard.claim_with(channel_id, lease_ms, now, |m, p| body.push(m, p)) {
+                Ok(Some(())) => got += 1,
+                Ok(None) | Err(_) => break,
+            }
+            if body.len() >= DISPATCH_MAX_BYTES {
+                queue_frame(std::mem::take(&mut body), id, rid, pending, shared);
+            }
+        }
+        if got > 0 {
+            st.credits.fetch_sub(got, Ordering::AcqRel);
+            if !body.is_empty() {
+                queue_frame(body, id, rid, pending, shared);
+            }
+        }
+        let left = credits - got;
+        if !multi || left == 0 || st.remote_busy.load(Ordering::Acquire) {
+            continue;
+        }
+        let gen = engine.notify_ticks();
+        let retry = !st.remote_empty.load(Ordering::Acquire) || st.remote_gen.load(Ordering::Acquire) != gen || now >= st.retry_at.load(Ordering::Acquire);
+        if !retry {
+            continue;
+        }
+        let rwant = left.min(DISPATCH_MAX);
+        st.remote_busy.store(true, Ordering::Release);
+        st.remote_gen.store(gen, Ordering::Release);
+        // Armé avant la requête : un job prêt pendant la réservation réveille ce réacteur.
+        hungry.store(true, Ordering::Release);
+        st.credits.fetch_sub(rwant, Ordering::AcqRel);
+        let (shared, st) = (shared.clone(), st.clone());
+        engine.claim_many_async(channel_id, lease_ms, rwant as usize, index, move |res| {
+            let (jobs, error) = match res {
+                Ok(jobs) => (jobs, None),
+                Err(e) => (Vec::new(), Some(e)),
+            };
+            st.credits.fetch_add(rwant - jobs.len() as u64, Ordering::AcqRel);
+            st.remote_empty.store(jobs.is_empty(), Ordering::Release);
+            let delay = if error.is_some() { 1000 } else { REMOTE_RETRY_MS };
+            st.retry_at.store(now_ms() + delay, Ordering::Release);
+            if let Some(e) = error {
+                shared.respond(id, Response::Error(e).to_frame(msg::DISPATCH, rid));
+            }
+            let mut chunk = Vec::new();
+            let mut bytes = 0usize;
+            let mut jobs = jobs.into_iter().peekable();
+            while let Some(job) = jobs.next() {
+                bytes += job.payload.len() + 64;
+                chunk.push(job);
+                if bytes >= DISPATCH_MAX_BYTES || jobs.peek().is_none() {
+                    shared.respond(id, Response::Dispatch(std::mem::take(&mut chunk)).to_frame(msg::DISPATCH, rid));
+                    bytes = 0;
+                }
+            }
+            st.remote_busy.store(false, Ordering::Release);
+            shared.wake();
+        });
+    }
+}
+
+/// `SOLID_ENGINE_REACTOR_PIN=1` : épingle le réacteur `index` sur le cœur `index` (modulo les cœurs disponibles).
+fn pin_to_core(index: usize) {
+    if std::env::var_os("SOLID_ENGINE_REACTOR_PIN").is_none() {
+        return;
+    }
+    extern "C" {
+        fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+    }
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let cpu = index % cpus;
+    let mut mask = [0u64; 16];
+    mask[cpu / 64] = 1 << (cpu % 64);
+    unsafe { sched_setaffinity(0, std::mem::size_of_val(&mask), mask.as_ptr()) };
 }
 
 fn to_response(r: Result<Response>) -> Response {

@@ -69,6 +69,64 @@ Test d'arrêt : `shutdown_returns_promptly_with_no_incoming_connection` (< 500 m
 
 Réserves : un HAProxy client est dans la boucle de mesure ; certificat auto-signé (vérifié par le proxy client dans la campagne de saturation, non vérifié dans la première table) ;pas de reprise de session ni de TLS 1.3 forcé ; saturation et connexions courtes à haut débit non mesurées ; aucune comparaison avec un TLS natif (rustls).
 
+## Requêtes par lot
+
+Trois requêtes évitent un aller-retour par job (types 12, 13 et 17, ajout compatible : un ancien serveur répond `BadRequest`) :
+
+- `ClaimBatch { channel_id, lease_ms, max, wait_ms }` → `ClaimBatch(Vec<ClaimedJob>)` : réserve jusqu'à `max` jobs (plafond serveur : 1024). Seul le premier peut attendre `wait_ms` ; les suivants ne prennent que ce qui est déjà prêt. Une réponse vide signifie « rien de prêt ».
+- `AckBatch(Vec<Reservation>)` → `AckBatch(Vec<Option<EngineError>>)` : un résultat par réservation, dans l'ordre. Chaque ACK est vérifié séparément (`job_id`, `reservation_id`, jeton de fencing) : un ACK périmé est rejeté sans empêcher les autres.
+
+- `PushBatch(Vec<PushRequest>)` → `PushBatch(Vec<Result<PushOutcome, EngineError>>)` : publie jusqu'à 256 jobs (trame limitée à 4 MiB ; au-delà, `BadRequest` et rien n'est publié). Les jobs sont regroupés par shard (une commande par shard) et la réponse contient un résultat par job, dans l'ordre : une erreur individuelle (payload trop gros, etc.) n'empêche pas les autres. En mode strict, la réponse n'est envoyée qu'après le fsync WAL de tous les shards concernés. Le lot n'est pas atomique entre shards : après un échec ou une déconnexion, rejouer tout le lot est sûr, les jobs déjà publiés répondent `duplicate` (idempotence par `job_id`).
+
+Les jobs d'un lot ont chacun leur bail ; l'appelant doit les prolonger (`ExtendLease`) s'ils attendent longtemps avant d'être traités.
+
+Mesure indicative (macOS, 12 CPU logiques, 100 000 jobs, lots de 200, SolidEngine `memory`) : publication 390 k jobs/s avec 1 producteur, 1,17 M avec 4, 1,42 M avec 8 (contre 88 k avec un aller-retour par job). Publication seule, hors consommation.
+
+## Hyperlane : abonnement avec crédits
+
+Le serveur pousse les jobs au lieu d'attendre un `ClaimBatch` par lot (ajout compatible) :
+
+- `Subscribe { channel_id, lease_ms, credits }` → `Subscribed`, puis des trames `Dispatch(Vec<ClaimedJob>)` envoyées de façon asynchrone avec le `request_id` du `Subscribe`. Une connexion n'a qu'un abonnement.
+- `Credit { credits }` autorise `credits` jobs de plus. Le serveur ne pousse jamais plus de jobs que de crédits ; les jobs reçus ont chacun leur bail, leur jeton de fencing et sont acquittés par `AckBatch` comme d'habitude. À la déconnexion, leurs baux expirent et ils sont redistribués.
+- Les trames `Dispatch` sont bornées à 256 Ko ; en `balanced` et `strict`, elles ne partent qu'après la durabilité de la réservation.
+- `AckBatch` est traité sans bloquer le lecteur de la connexion : les trames suivantes (par exemple `Credit`) sont lues pendant que les shards acquittent, et les réponses sont associées par `request_id`. Le nombre de requêtes en attente par connexion reste borné (`MAX_IN_FLIGHT = 256`).
+
+Le chemin à threads encode les trames `Dispatch` directement depuis le shard (`Shard::claim_with`, `DispatchBody`) : le payload n'est copié qu'une fois, sans `Vec<ClaimedJob>` intermédiaire.
+
+**Fusion** (expérimental, Linux, désactivé par défaut) : `SOLID_ENGINE_REACTORS=4 SOLID_ENGINE_REACTOR_DIRECT=1`. Le réacteur possède son shard et sert les abonnements localement ; les autres shards sont sollicités par réservation asynchrone. Aucun gain démontré face au chemin à threads, qui reste le défaut. `SOLID_ENGINE_REACTOR_PIN=1` épingle les réacteurs sur des cœurs (non mesuré). `SOLID_ENGINE_HYPER_FANOUT=1` réserve sur tous les shards en parallèle (aucun gain démontré).
+
+### Mesures Hyperlane contre Redis (Linux, Docker, 12 CPU, 4 shards, 2 M de jobs, 256 B, moyenne de 3 runs)
+
+Fenêtre de production de 1000 jobs par aller-retour pour tous ; Redis sans persistance (LPUSH/RPOPLPUSH/LREM), SolidEngine `memory` sauf mention. Variabilité entre runs de ±10 %.
+
+| Config (jobs/s) | 1 worker | 8 workers |
+|---|---:|---:|
+| Redis | 520 k | 536 k |
+| Hyperlane, 256 crédits | 412 k | 518 k |
+| Hyperlane, 64 crédits | 317 k | 509 k |
+| Hyperlane, 256 crédits, balanced | 319 k | 421 k |
+| Fusion, 64 crédits | 238 k | 479 k |
+| Pipeline `ClaimBatch` / `AckBatch` | 136 k | 153 k |
+
+Enseignements : (1) les benchmarks de 40 000 jobs étaient dominés par le démarrage ; (2) avec une fenêtre de production de 64, les `Dispatch` ne contenaient en moyenne que 15 à 25 jobs et le banc plafonnait à ≈ 300 k à 1 worker ; (3) le lecteur du serveur attendait l'`AckBatch` avant de lire le `Credit` suivant : le traitement asynchrone a fait passer 1 worker de 297 k à 411 k ; (4) le moteur seul (`examples/engine_batch.rs`, sans réseau, 1 shard, lots de 100) fait ≈ 590 k jobs/s : le plafond vient du chemin réseau, pas des shards. Redis reste devant à 1 worker (≈ 79 %) et à parité à 8 workers (≈ 97 %), mais sans durabilité ni leases ni fencing.
+
+### Où se trouve le plafond à 1 worker (même environnement ; chaque tableau compare des runs d'un même binaire du banc)
+
+- **Le plafond de ≈ 400 k n'est pas dans le moteur.** Le dispatcher passe ≈ 94 % de son temps dans la réservation, mais le temps par job reste ≈ 2,35 µs quelle que soit la stratégie : copies du payload (C, D), nombre de shards (1 à 8), crédits au-delà de 256, réservation parallèle sur les shards (`SOLID_ENGINE_CLAIM_FANOUT=1`, aucun gain, désactivé). `SOLID_ENGINE_DISPATCH_TRACE=<fichier>` écrit les temps du dispatcher et les latences des `ClaimDispatch` (attente en file moyenne 25 µs, exécution 11,6 µs).
+- **Le producteur du banc limite.** `BENCH_PRODUCERS=N` (connexions de production par worker), fenêtre totale 1000 constante, Hyperlane 256 crédits, 1 worker :
+
+| Producteurs | memory | balanced | strict |
+|---|---:|---:|---:|
+| 1 | ≈ 357 k | ≈ 314 k | ≈ 121 k |
+| 2 | ≈ 556 k | ≈ 462 k | ≈ 137 k |
+| 4 | ≈ 534 k | — | — |
+| 8 | ≈ 491 k | — | — |
+
+- **Backlog préchargé** (`BENCH_PRELOAD=1`, seule la consommation est chronométrée, ACK inclus) : 858 k à 956 k jobs/s. Ce n'est pas un débit de bout en bout.
+- **Redis à nombre de connexions égal** (fenêtre 1000 par connexion, sans persistance) : 1 connexion ≈ 521 k, 2 ≈ 555 k, 3 ≈ 568 k ; Hyperlane 2 producteurs + 1 consommateur (3 connexions) ≈ 556 k. Parité approximative (≈ 97–99 %), pas de dépassement démontré. Le banc Redis fait tout le cycle sur une seule connexion : il n'y a pas d'équivalent exact à « plusieurs producteurs ».
+- **Biais connu du banc.** Le même banc, sans `BENCH_PRODUCERS`, donne ≈ 403 k à 1 producteur, contre ≈ 357 k avec le code actuel (10 à 12 % de moins, reproductible sur des runs alternés). Le serveur et la logique de production sont identiques ; la cause n'est pas élucidée (hypothèse : génération de code de la boucle de consommation du client, qui est le thread le plus chargé, ≈ 95 % d'un cœur). Un écart de cette taille causé par du code client confirme que le banc, et pas le moteur, limite les mesures à 1 producteur. Ne comparer entre eux que des runs d'un même binaire.
+- **strict** est limité par la durabilité (fsync), pas par la production ; les fsync n'ont pas encore été mesurés. Redis sans persistance n'est comparable à aucun des modes balanced ou strict.
+
 ## Benchmark (phase 5)
 
 Banc : `../benchmark_solid_engine` (crate indépendante).

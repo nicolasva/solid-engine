@@ -109,6 +109,16 @@ pub struct PushOutcome {
     pub duplicate: bool,
 }
 
+/// Réservation d'un job, sans son payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaimMeta {
+    pub job_id: u128,
+    pub reservation_id: u64,
+    pub fencing_token: u64,
+    pub lease_deadline: u64,
+    pub attempts: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimedJob {
     pub job_id: u128,

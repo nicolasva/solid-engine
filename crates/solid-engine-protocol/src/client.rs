@@ -37,6 +37,20 @@ impl<S: Read + Write> Client<S> {
         self.call(&Request::Auth(token.to_vec()))
     }
 
+    /// Envoie une requête sans attendre de réponse (Credit, ou pipeline).
+    pub fn send(&mut self, req: &Request) -> Result<u64, ProtocolError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        write_frame(&mut self.stream, &req.to_frame(id))?;
+        Ok(id)
+    }
+
+    /// Lit la prochaine trame du serveur (réponse ou dispatch poussé).
+    pub fn recv(&mut self) -> Result<(u64, Response), ProtocolError> {
+        let frame = read_frame(&mut self.stream, MAX_RESPONSE_BYTES)?;
+        Ok((frame.request_id, Response::decode(frame.msg_type, &frame.body)?))
+    }
+
     pub fn call(&mut self, req: &Request) -> Result<Response, ProtocolError> {
         let id = self.next_id;
         self.next_id += 1;

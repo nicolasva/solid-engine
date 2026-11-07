@@ -41,9 +41,16 @@ fn config(dir: &PathBuf, durability: Durability) -> Config {
 
 #[test]
 fn restart_preserves_confirmed_jobs_across_snapshots() {
-    let dir = temp_dir("restart");
+    for (tag, mode) in [("restart", Durability::Strict), ("restart-balanced", Durability::Balanced)] {
+        restart_across_snapshots(tag, mode);
+    }
+}
+
+// Les snapshots sont écrits par le thread WAL pendant que le shard continue : l'état reconstruit doit rester exact.
+fn restart_across_snapshots(tag: &str, mode: Durability) {
+    let dir = temp_dir(tag);
     {
-        let server = Server::start(config(&dir, Durability::Strict)).unwrap();
+        let server = Server::start(config(&dir, mode)).unwrap();
         let mut c = Client::connect_tcp(server.tcp_addr().unwrap()).unwrap();
         // Plus de 50 enregistrements par shard : au moins un snapshot est pris en cours de route.
         for id in 1..=300u128 {
@@ -52,7 +59,7 @@ fn restart_preserves_confirmed_jobs_across_snapshots() {
         server.shutdown();
     }
     for _ in 0..2 {
-        let server = Server::start(config(&dir, Durability::Strict)).unwrap();
+        let server = Server::start(config(&dir, mode)).unwrap();
         let mut c = Client::connect_tcp(server.tcp_addr().unwrap()).unwrap();
         let Response::Stats(s) = c.call(&Request::GetQueueStats { channel_id: Some(1) }).unwrap() else { panic!() };
         assert_eq!(s.ready, 300);

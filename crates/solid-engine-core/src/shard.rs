@@ -201,9 +201,43 @@ impl Shard {
 
     /// Applique une mutation et la journalise : un seul chemin pour le live et le replay.
     fn commit(&mut self, rec: Record) {
+        if !self.logging {
+            // Rien à journaliser : le payload passe dans le job sans copie.
+            if let Record::Push { job_id, channel_id, priority, max_attempts, created_at, scheduled_at, payload } = rec {
+                self.insert_pushed(job_id, channel_id, priority, max_attempts, created_at, scheduled_at, payload);
+            } else {
+                self.apply(&rec);
+            }
+            return;
+        }
         self.apply(&rec);
-        if self.logging {
-            self.log.push(rec);
+        self.log.push(rec);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_pushed(&mut self, job_id: u128, channel_id: u16, priority: u8, max_attempts: u32, created_at: u64, scheduled_at: u64, payload: Vec<u8>) {
+        let job = Job {
+            id: job_id,
+            channel_id,
+            state: JobState::Ready,
+            priority,
+            attempts: 0,
+            max_attempts,
+            fencing_token: 0,
+            reservation_id: 0,
+            lease_deadline: 0,
+            scheduled_at,
+            created_at,
+            seq: 0,
+            payload_len: payload.len() as u32,
+            payload,
+        };
+        self.bump(channel_id, JobState::Ready, 1);
+        self.jobs.insert(job_id, job);
+        if scheduled_at > created_at {
+            self.schedule(job_id, scheduled_at);
+        } else {
+            self.make_ready(job_id);
         }
     }
 
@@ -211,29 +245,7 @@ impl Shard {
     pub fn apply(&mut self, rec: &Record) {
         match rec {
             Record::Push { job_id, channel_id, priority, max_attempts, created_at, scheduled_at, payload } => {
-                let job = Job {
-                    id: *job_id,
-                    channel_id: *channel_id,
-                    state: JobState::Ready,
-                    priority: *priority,
-                    attempts: 0,
-                    max_attempts: *max_attempts,
-                    fencing_token: 0,
-                    reservation_id: 0,
-                    lease_deadline: 0,
-                    scheduled_at: *scheduled_at,
-                    created_at: *created_at,
-                    seq: 0,
-                    payload_len: payload.len() as u32,
-                    payload: payload.clone(),
-                };
-                self.bump(*channel_id, JobState::Ready, 1);
-                self.jobs.insert(*job_id, job);
-                if scheduled_at > created_at {
-                    self.schedule(*job_id, *scheduled_at);
-                } else {
-                    self.make_ready(*job_id);
-                }
+                self.insert_pushed(*job_id, *channel_id, *priority, *max_attempts, *created_at, *scheduled_at, payload.clone());
             }
             Record::Claim { job_id, reservation_id, fencing_token, lease_deadline } => {
                 let Some(job) = self.jobs.get_mut(job_id) else { return };
@@ -448,6 +460,24 @@ impl Shard {
     }
 
     pub fn claim(&mut self, channel_id: u16, lease_ms: u32, now: u64) -> Result<Option<ClaimedJob>> {
+        self.claim_with(channel_id, lease_ms, now, |c, payload| ClaimedJob {
+            job_id: c.job_id,
+            reservation_id: c.reservation_id,
+            fencing_token: c.fencing_token,
+            lease_deadline: c.lease_deadline,
+            attempts: c.attempts,
+            payload: payload.to_vec(),
+        })
+    }
+
+    /// Comme `claim`, mais `f` lit le payload en place : aucune copie ni allocation pour l'appelant.
+    pub fn claim_with<R>(
+        &mut self,
+        channel_id: u16,
+        lease_ms: u32,
+        now: u64,
+        f: impl FnOnce(&ClaimMeta, &[u8]) -> R,
+    ) -> Result<Option<R>> {
         self.tick(now);
         let lease_ms = if lease_ms == 0 { self.cfg.jobs.default_lease_ms } else { lease_ms }
             .min(self.cfg.jobs.max_lease_ms);
@@ -458,16 +488,10 @@ impl Shard {
         let lease_deadline = now + lease_ms as u64;
         self.commit(Record::Claim { job_id: id, reservation_id, fencing_token, lease_deadline });
         let job = &self.jobs[&id];
-        let claimed = ClaimedJob {
-            job_id: id,
-            reservation_id,
-            fencing_token,
-            lease_deadline,
-            attempts: job.attempts,
-            payload: job.payload.clone(),
-        };
+        let meta = ClaimMeta { job_id: id, reservation_id, fencing_token, lease_deadline, attempts: job.attempts };
+        let out = f(&meta, &job.payload);
         self.counters.claims += 1;
-        Ok(Some(claimed))
+        Ok(Some(out))
     }
 
     pub fn ack(&mut self, r: Reservation, now: u64) -> Result<()> {

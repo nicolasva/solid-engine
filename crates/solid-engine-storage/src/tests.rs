@@ -167,6 +167,57 @@ fn corrupt_snapshot_without_wal_history_is_an_error() {
     assert!(matches!(recover_shard(&t.0, 0, cfg()), Err(StorageError::Corrupt(_))));
 }
 
+fn copy_files(from: &Path, to: &Path) {
+    for e in fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        if e.file_type().unwrap().is_file() && e.file_name() != "LOCK" {
+            fs::copy(e.path(), to.join(e.file_name())).unwrap();
+        }
+    }
+}
+
+// Un arrêt brutal peut survenir entre les étapes de `Wal::snapshot` : publication du snapshot, création du
+// nouveau segment, suppression de l'ancien. Chaque état intermédiaire doit se récupérer sans perte ni doublon.
+#[test]
+fn crash_between_snapshot_steps_recovers_exactly() {
+    let t = TempDir::new("snapcrash");
+    let (mut shard, mut wal) = recover_shard(&t.0, 0, cfg()).unwrap();
+    for id in 1..=5 {
+        shard.push(push(id), now_ms()).unwrap();
+    }
+    let c = shard.claim(1, 60_000, now_ms()).unwrap().unwrap();
+    persist(&mut shard, &mut wal);
+    let before = TempDir::new("snapcrash-before");
+    copy_files(&t.0, &before.0);
+    wal.snapshot(&shard.encode_snapshot()).unwrap();
+    shard.ack(reservation(&c), now_ms()).unwrap();
+    persist(&mut shard, &mut wal);
+    drop((shard, wal));
+    let old_segment = list(&before.0, "wal-", ".log").unwrap().pop().unwrap();
+    let snap_seq = list(&t.0, "snap-", ".snap").unwrap().pop().unwrap().0;
+
+    // 1. snapshot publié, ancien segment encore présent, nouveau segment absent.
+    // 2. snapshot publié, ancien et nouveau segments présents.
+    for (tag, keep_new) in [("published", false), ("rotated", true)] {
+        let d = TempDir::new(tag);
+        fs::copy(list(&t.0, "snap-", ".snap").unwrap().pop().unwrap().1, d.0.join(snapshot_name(snap_seq))).unwrap();
+        fs::copy(&old_segment.1, d.0.join(segment_name(old_segment.0))).unwrap();
+        let new_segment = list(&t.0, "wal-", ".log").unwrap().pop().unwrap();
+        if keep_new {
+            fs::copy(&new_segment.1, d.0.join(segment_name(new_segment.0))).unwrap();
+        }
+        let (mut shard, mut wal) = recover_shard(&d.0, 0, cfg()).unwrap();
+        // Le nouveau segment contient l'ACK posté après le snapshot.
+        let ready = if keep_new { 4 } else { 5 };
+        assert_eq!(shard.stats(Some(1), now_ms()).ready, ready, "{tag}");
+        shard.push(push(9), now_ms()).unwrap();
+        persist(&mut shard, &mut wal);
+        drop((shard, wal));
+        let (mut shard, _) = recover_shard(&d.0, 0, cfg()).unwrap();
+        assert_eq!(shard.stats(Some(1), now_ms()).ready, ready + 1, "{tag}");
+    }
+}
+
 #[test]
 fn incomplete_snapshot_file_is_ignored() {
     let t = TempDir::new("tmpsnap");

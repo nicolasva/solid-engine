@@ -9,8 +9,8 @@ pub mod client;
 mod codec;
 mod message;
 
-pub use codec::{read_frame, write_frame, Frame, ProtocolError, HEADER_LEN, MAGIC, VERSION};
-pub use message::{Request, Response};
+pub use codec::{append_frame, read_frame, write_frame, write_pending_and_frame, Frame, ProtocolError, HEADER_LEN, MAGIC, VERSION};
+pub use message::{DispatchBody, Request, Response};
 
 pub mod msg {
     pub const PING: u8 = 1;
@@ -24,6 +24,14 @@ pub mod msg {
     pub const WAIT_FOR_JOB: u8 = 9;
     pub const GET_QUEUE_STATS: u8 = 10;
     pub const AUTH: u8 = 11;
+    pub const CLAIM_BATCH: u8 = 12;
+    pub const ACK_BATCH: u8 = 13;
+    pub const SUBSCRIBE: u8 = 14;
+    pub const CREDIT: u8 = 15;
+    /// Trame poussée par le serveur : jobs attribués à un abonnement (`request_id` = celui du Subscribe).
+    pub const DISPATCH: u8 = 16;
+    /// Publie plusieurs jobs en une requête ; un résultat par job dans la réponse.
+    pub const PUSH_BATCH: u8 = 17;
     pub const RESPONSE_BIT: u8 = 0x80;
     pub const ERROR: u8 = 0xFF;
 }

@@ -22,10 +22,24 @@ pub enum Request {
     CancelJob { job_id: u128 },
     WaitForJob { channel_id: u16, timeout_ms: u32 },
     GetQueueStats { channel_id: Option<u16> },
+    /// Réserve jusqu'à `max` jobs d'un coup ; attend `wait_ms` au plus pour le premier seulement.
+    ClaimBatch { channel_id: u16, lease_ms: u32, max: u32, wait_ms: u32 },
+    /// Acquitte plusieurs réservations ; chacune est vérifiée (fencing) et rapportée séparément.
+    AckBatch(Vec<Reservation>),
+    /// Publie plusieurs jobs d'un coup ; chacun est validé et rapporté séparément (succès partiel possible).
+    PushBatch(Vec<PushRequest>),
+    /// Hyperlane : le serveur pousse les jobs de la queue sur cette connexion, dans la limite des crédits.
+    /// Une seule souscription par connexion ; les jobs non acquittés expirent comme des claims normaux.
+    Subscribe { channel_id: u16, lease_ms: u32, credits: u32 },
+    /// Ajoute des crédits à la souscription. Sans réponse : le serveur ne répond jamais à un Credit.
+    Credit { credits: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Response {
+    Subscribed,
+    /// Trame poussée (type `msg::DISPATCH`), jamais une réponse à une requête.
+    Dispatch(Vec<ClaimedJob>),
     Pong,
     Authed,
     Push(PushOutcome),
@@ -37,13 +51,113 @@ pub enum Response {
     Cancel,
     Wait { available: bool },
     Stats(Stats),
+    ClaimBatch(Vec<ClaimedJob>),
+    /// Un résultat par réservation, dans l'ordre de la requête : `None` si l'ACK est accepté.
+    AckBatch(Vec<Option<EngineError>>),
+    /// Un résultat par job, dans l'ordre de la requête.
+    PushBatch(Vec<Result<PushOutcome, EngineError>>),
     Error(EngineError),
+}
+
+fn put_push(b: &mut Vec<u8>, p: &PushRequest) {
+    b.put_u128(p.job_id);
+    b.put_u16(p.channel_id);
+    b.push(p.priority);
+    b.put_u32(p.max_attempts);
+    b.put_u64(p.delay_ms);
+    b.put_bytes(&p.partition_key);
+    b.put_bytes(&p.payload);
+}
+
+fn get_push(r: &mut Reader) -> Result<PushRequest, ProtocolError> {
+    Ok(PushRequest {
+        job_id: r.u128()?,
+        channel_id: r.u16()?,
+        priority: r.u8()?,
+        max_attempts: r.u32()?,
+        delay_ms: r.u64()?,
+        partition_key: r.bytes()?,
+        payload: r.bytes()?,
+    })
 }
 
 fn put_reservation(b: &mut Vec<u8>, r: &Reservation) {
     b.put_u128(r.job_id);
     b.put_u64(r.reservation_id);
     b.put_u64(r.fencing_token);
+}
+
+/// Corps d'une trame `Dispatch` construit sans objet intermédiaire : les jobs sont encodés un à un,
+/// payload copié une seule fois depuis le stockage du shard.
+pub struct DispatchBody {
+    buf: Vec<u8>,
+    count: u32,
+}
+
+impl Default for DispatchBody {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DispatchBody {
+    pub fn new() -> Self {
+        let mut buf = Vec::with_capacity(4096);
+        buf.put_u32(0);
+        Self { buf, count: 0 }
+    }
+
+    pub fn push(&mut self, c: &solid_engine_core::ClaimMeta, payload: &[u8]) {
+        self.buf.put_u128(c.job_id);
+        self.buf.put_u64(c.reservation_id);
+        self.buf.put_u64(c.fencing_token);
+        self.buf.put_u64(c.lease_deadline);
+        self.buf.put_u32(c.attempts);
+        self.buf.put_bytes(payload);
+        self.count += 1;
+    }
+
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn count(&self) -> usize {
+        self.count as usize
+    }
+
+    pub fn into_frame(mut self, request_id: u64) -> crate::Frame {
+        self.buf[..4].copy_from_slice(&self.count.to_le_bytes());
+        crate::Frame {
+            msg_type: msg::DISPATCH | msg::RESPONSE_BIT,
+            flags: 0,
+            request_id,
+            body: self.buf,
+        }
+    }
+}
+
+fn put_claimed(b: &mut Vec<u8>, c: &ClaimedJob) {
+    b.put_u128(c.job_id);
+    b.put_u64(c.reservation_id);
+    b.put_u64(c.fencing_token);
+    b.put_u64(c.lease_deadline);
+    b.put_u32(c.attempts);
+    b.put_bytes(&c.payload);
+}
+
+fn get_claimed(r: &mut Reader) -> Result<ClaimedJob, ProtocolError> {
+    Ok(ClaimedJob {
+        job_id: r.u128()?,
+        reservation_id: r.u64()?,
+        fencing_token: r.u64()?,
+        lease_deadline: r.u64()?,
+        attempts: r.u32()?,
+        payload: r.bytes()?,
+    })
 }
 
 fn get_reservation(r: &mut Reader) -> Result<Reservation, ProtocolError> {
@@ -64,6 +178,11 @@ impl Request {
             Self::CancelJob { .. } => msg::CANCEL_JOB,
             Self::WaitForJob { .. } => msg::WAIT_FOR_JOB,
             Self::GetQueueStats { .. } => msg::GET_QUEUE_STATS,
+            Self::ClaimBatch { .. } => msg::CLAIM_BATCH,
+            Self::AckBatch(_) => msg::ACK_BATCH,
+            Self::PushBatch(_) => msg::PUSH_BATCH,
+            Self::Subscribe { .. } => msg::SUBSCRIBE,
+            Self::Credit { .. } => msg::CREDIT,
         }
     }
 
@@ -72,14 +191,12 @@ impl Request {
         match self {
             Self::Ping => {}
             Self::Auth(t) => b.put_bytes(t),
-            Self::PushJob(p) => {
-                b.put_u128(p.job_id);
-                b.put_u16(p.channel_id);
-                b.push(p.priority);
-                b.put_u32(p.max_attempts);
-                b.put_u64(p.delay_ms);
-                b.put_bytes(&p.partition_key);
-                b.put_bytes(&p.payload);
+            Self::PushJob(p) => put_push(&mut b, p),
+            Self::PushBatch(ps) => {
+                b.put_u32(ps.len() as u32);
+                for p in ps {
+                    put_push(&mut b, p);
+                }
             }
             Self::ClaimNextJob { channel_id, lease_ms, wait_ms } => {
                 b.put_u16(*channel_id);
@@ -113,6 +230,24 @@ impl Request {
                 b.push(channel_id.is_some() as u8);
                 b.put_u16(channel_id.unwrap_or(0));
             }
+            Self::ClaimBatch { channel_id, lease_ms, max, wait_ms } => {
+                b.put_u16(*channel_id);
+                b.put_u32(*lease_ms);
+                b.put_u32(*max);
+                b.put_u32(*wait_ms);
+            }
+            Self::AckBatch(rs) => {
+                b.put_u32(rs.len() as u32);
+                for r in rs {
+                    put_reservation(&mut b, r);
+                }
+            }
+            Self::Subscribe { channel_id, lease_ms, credits } => {
+                b.put_u16(*channel_id);
+                b.put_u32(*lease_ms);
+                b.put_u32(*credits);
+            }
+            Self::Credit { credits } => b.put_u32(*credits),
         }
         b
     }
@@ -122,15 +257,19 @@ impl Request {
         let req = match msg_type {
             msg::PING => Self::Ping,
             msg::AUTH => Self::Auth(r.bytes()?),
-            msg::PUSH_JOB => Self::PushJob(PushRequest {
-                job_id: r.u128()?,
-                channel_id: r.u16()?,
-                priority: r.u8()?,
-                max_attempts: r.u32()?,
-                delay_ms: r.u64()?,
-                partition_key: r.bytes()?,
-                payload: r.bytes()?,
-            }),
+            msg::PUSH_JOB => Self::PushJob(get_push(&mut r)?),
+            msg::PUSH_BATCH => {
+                let n = r.u32()? as usize;
+                // 39 octets au minimum par job (champs fixes + deux préfixes de longueur).
+                if n > body.len() / 39 {
+                    return Err(ProtocolError::Malformed("batch count exceeds body"));
+                }
+                let mut ps = Vec::with_capacity(n);
+                for _ in 0..n {
+                    ps.push(get_push(&mut r)?);
+                }
+                Self::PushBatch(ps)
+            }
             msg::CLAIM_NEXT_JOB => {
                 Self::ClaimNextJob { channel_id: r.u16()?, lease_ms: r.u32()?, wait_ms: r.u32()? }
             }
@@ -155,6 +294,26 @@ impl Request {
                 let (has, ch) = (r.u8()?, r.u16()?);
                 Self::GetQueueStats { channel_id: (has != 0).then_some(ch) }
             }
+            msg::CLAIM_BATCH => Self::ClaimBatch {
+                channel_id: r.u16()?,
+                lease_ms: r.u32()?,
+                max: r.u32()?,
+                wait_ms: r.u32()?,
+            },
+            msg::ACK_BATCH => {
+                let n = r.u32()? as usize;
+                // 32 octets par réservation : borne le Vec par la taille réelle du corps.
+                if n > body.len() / 32 {
+                    return Err(ProtocolError::Malformed("batch count exceeds body"));
+                }
+                let mut rs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    rs.push(get_reservation(&mut r)?);
+                }
+                Self::AckBatch(rs)
+            }
+            msg::SUBSCRIBE => Self::Subscribe { channel_id: r.u16()?, lease_ms: r.u32()?, credits: r.u32()? },
+            msg::CREDIT => Self::Credit { credits: r.u32()? },
             _ => return Err(ProtocolError::Malformed("unknown message type")),
         };
         r.finish()?;
@@ -177,7 +336,7 @@ impl Response {
     pub fn encode_body(&self) -> Vec<u8> {
         let mut b = Vec::new();
         match self {
-            Self::Pong | Self::Authed | Self::Ack | Self::Nack | Self::Cancel => {}
+            Self::Pong | Self::Authed | Self::Ack | Self::Nack | Self::Cancel | Self::Subscribed => {}
             Self::Push(o) => {
                 b.put_u128(o.job_id);
                 b.push(o.duplicate as u8);
@@ -185,12 +344,7 @@ impl Response {
             Self::Claim(None) => b.push(0),
             Self::Claim(Some(c)) => {
                 b.push(1);
-                b.put_u128(c.job_id);
-                b.put_u64(c.reservation_id);
-                b.put_u64(c.fencing_token);
-                b.put_u64(c.lease_deadline);
-                b.put_u32(c.attempts);
-                b.put_bytes(&c.payload);
+                put_claimed(&mut b, c);
             }
             Self::ExtendLease { lease_deadline } => b.put_u64(*lease_deadline),
             Self::Job(j) => {
@@ -213,6 +367,42 @@ impl Response {
                     s.acks, s.nacks, s.lease_expirations,
                 ] {
                     b.put_u64(v);
+                }
+            }
+            Self::ClaimBatch(jobs) | Self::Dispatch(jobs) => {
+                b.put_u32(jobs.len() as u32);
+                for c in jobs {
+                    put_claimed(&mut b, c);
+                }
+            }
+            Self::PushBatch(results) => {
+                b.put_u32(results.len() as u32);
+                for res in results {
+                    match res {
+                        Ok(o) => {
+                            b.push(0);
+                            b.put_u128(o.job_id);
+                            b.push(o.duplicate as u8);
+                        }
+                        Err(e) => {
+                            b.push(1);
+                            b.put_u16(e.code as u16);
+                            b.put_bytes(e.message.as_bytes());
+                        }
+                    }
+                }
+            }
+            Self::AckBatch(results) => {
+                b.put_u32(results.len() as u32);
+                for res in results {
+                    match res {
+                        None => b.push(0),
+                        Some(e) => {
+                            b.push(1);
+                            b.put_u16(e.code as u16);
+                            b.put_bytes(e.message.as_bytes());
+                        }
+                    }
                 }
             }
             Self::Error(e) => {
@@ -242,14 +432,7 @@ impl Response {
                     if r.u8()? == 0 {
                         Self::Claim(None)
                     } else {
-                        Self::Claim(Some(ClaimedJob {
-                            job_id: r.u128()?,
-                            reservation_id: r.u64()?,
-                            fencing_token: r.u64()?,
-                            lease_deadline: r.u64()?,
-                            attempts: r.u32()?,
-                            payload: r.bytes()?,
-                        }))
+                        Self::Claim(Some(get_claimed(&mut r)?))
                     }
                 }
                 msg::ACK_JOB => Self::Ack,
@@ -283,6 +466,57 @@ impl Response {
                     nacks: r.u64()?,
                     lease_expirations: r.u64()?,
                 }),
+                msg::CLAIM_BATCH | msg::DISPATCH => {
+                    let n = r.u32()? as usize;
+                    // Au moins 44 octets par job réservé.
+                    if n > body.len() / 44 {
+                        return Err(ProtocolError::Malformed("batch count exceeds body"));
+                    }
+                    let mut jobs = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        jobs.push(get_claimed(&mut r)?);
+                    }
+                    if msg_type & !msg::RESPONSE_BIT == msg::DISPATCH {
+                        Self::Dispatch(jobs)
+                    } else {
+                        Self::ClaimBatch(jobs)
+                    }
+                }
+                msg::SUBSCRIBE => Self::Subscribed,
+                msg::PUSH_BATCH => {
+                    let n = r.u32()? as usize;
+                    if n > body.len() {
+                        return Err(ProtocolError::Malformed("batch count exceeds body"));
+                    }
+                    let mut results = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        results.push(if r.u8()? == 0 {
+                            Ok(PushOutcome { job_id: r.u128()?, duplicate: r.u8()? != 0 })
+                        } else {
+                            let code = ErrorCode::from_u16(r.u16()?);
+                            let message = String::from_utf8_lossy(&r.bytes()?).into_owned();
+                            Err(EngineError { code, message })
+                        });
+                    }
+                    Self::PushBatch(results)
+                }
+                msg::ACK_BATCH => {
+                    let n = r.u32()? as usize;
+                    if n > body.len() {
+                        return Err(ProtocolError::Malformed("batch count exceeds body"));
+                    }
+                    let mut results = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        results.push(if r.u8()? == 0 {
+                            None
+                        } else {
+                            let code = ErrorCode::from_u16(r.u16()?);
+                            let message = String::from_utf8_lossy(&r.bytes()?).into_owned();
+                            Some(EngineError { code, message })
+                        });
+                    }
+                    Self::AckBatch(results)
+                }
                 _ => return Err(ProtocolError::Malformed("unknown response type")),
             }
         };
@@ -336,5 +570,49 @@ mod tests {
         let resp = Response::Stats(Stats { ready: 1, acks: 4, ..Default::default() });
         let f = resp.to_frame(msg::GET_QUEUE_STATS, 1);
         assert_eq!(Response::decode(f.msg_type, &f.body).unwrap(), resp);
+    }
+
+    #[test]
+    fn push_batch_roundtrip() {
+        let push = |id: u128| PushRequest {
+            job_id: id,
+            channel_id: 2,
+            priority: 5,
+            max_attempts: 3,
+            delay_ms: 0,
+            partition_key: b"k".to_vec(),
+            payload: vec![id as u8; 7],
+        };
+        let req = Request::PushBatch(vec![push(1), push(2), push(3)]);
+        let f = req.to_frame(9);
+        assert_eq!(Request::decode(f.msg_type, &f.body).unwrap(), req);
+        let resp = Response::PushBatch(vec![
+            Ok(PushOutcome { job_id: 1, duplicate: false }),
+            Err(EngineError::new(ErrorCode::BadRequest, "payload too large")),
+            Ok(PushOutcome { job_id: 3, duplicate: true }),
+        ]);
+        let body = resp.encode_body();
+        assert_eq!(Response::decode(msg::PUSH_BATCH | msg::RESPONSE_BIT, &body).unwrap(), resp);
+        // Un compteur forgé ne doit pas allouer.
+        assert!(Request::decode(msg::PUSH_BATCH, &u32::MAX.to_le_bytes()).is_err());
+    }
+
+    #[test]
+    fn batch_roundtrip() {
+        let req = Request::AckBatch(vec![Reservation { job_id: 1, reservation_id: 2, fencing_token: 3 }; 3]);
+        let f = req.to_frame(1);
+        assert_eq!(Request::decode(f.msg_type, &f.body).unwrap(), req);
+        let req = Request::ClaimBatch { channel_id: 1, lease_ms: 2, max: 3, wait_ms: 4 };
+        let f = req.to_frame(1);
+        assert_eq!(Request::decode(f.msg_type, &f.body).unwrap(), req);
+        let job = ClaimedJob { job_id: 7, reservation_id: 8, fencing_token: 9, lease_deadline: 10, attempts: 1, payload: vec![1, 2] };
+        let resp = Response::ClaimBatch(vec![job.clone(), job]);
+        let f = resp.to_frame(msg::CLAIM_BATCH, 1);
+        assert_eq!(Response::decode(f.msg_type, &f.body).unwrap(), resp);
+        let resp = Response::AckBatch(vec![None, Some(EngineError::new(ErrorCode::StaleReservation, "old"))]);
+        let f = resp.to_frame(msg::ACK_BATCH, 1);
+        assert_eq!(Response::decode(f.msg_type, &f.body).unwrap(), resp);
+        // Un compteur forgé ne doit pas provoquer d'allocation géante.
+        assert!(Request::decode(msg::ACK_BATCH, &u32::MAX.to_be_bytes()).is_err());
     }
 }
