@@ -89,7 +89,8 @@ impl Daemon {
     }
 
     fn start_with(dir: &PathBuf, snapshot_every_records: u64) -> Self {
-        let sock = dir.join("engine.sock");
+        // Nom court : `sun_path` est limité à 104 octets sur macOS et `$TMPDIR` y est déjà long.
+        let sock = dir.join("e.sock");
         let cfg_path = dir.join("engine.toml");
         let toml = format!(
             "[engine]\nshards = 2\n\n[server]\ntcp_addr = \"127.0.0.1:0\"\nunix_socket = \"{}\"\n\n\
