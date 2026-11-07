@@ -85,13 +85,18 @@ struct Daemon {
 
 impl Daemon {
     fn start(dir: &PathBuf) -> Self {
+        Self::start_with(dir, 100_000)
+    }
+
+    fn start_with(dir: &PathBuf, snapshot_every_records: u64) -> Self {
         let sock = dir.join("engine.sock");
         let cfg_path = dir.join("engine.toml");
         let toml = format!(
             "[engine]\nshards = 2\n\n[server]\ntcp_addr = \"127.0.0.1:0\"\nunix_socket = \"{}\"\n\n\
-             [storage]\ndurability = \"strict\"\ndata_dir = \"{}\"\n",
+             [storage]\ndurability = \"strict\"\ndata_dir = \"{}\"\nsnapshot_every_records = {}\n",
             sock.display(),
-            dir.join("data").display()
+            dir.join("data").display(),
+            snapshot_every_records
         );
         std::fs::write(&cfg_path, toml).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_solid-engine-server"))
@@ -155,4 +160,69 @@ fn sigkill_keeps_confirmed_pushes_and_fences_the_old_worker() {
         }
         daemon.sigkill();
     }
+}
+
+fn count_files(dir: &std::path::Path, pred: &dyn Fn(&std::path::Path) -> bool) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    rd.flatten()
+        .map(|e| {
+            let p = e.path();
+            if p.is_dir() { count_files(&p, pred) } else { usize::from(pred(&p)) }
+        })
+        .sum()
+}
+
+/// Vrai SIGKILL pendant que des snapshots sont écrits en continu (un tous les 20 enregistrements par shard) :
+/// à chaque redémarrage, tout job dont le push a été confirmé doit exister, et rien d'autre que des pushes envoyés.
+#[test]
+fn sigkill_during_continuous_snapshots_loses_no_confirmed_push() {
+    use std::sync::{Arc, Mutex};
+    let dir = temp_dir("sigkill-snap");
+    let confirmed: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
+    let (mut next_id, mut sent_max) = (1u128, 0u128);
+    let (mut with_tmp, mut with_snaps) = (0, 0);
+    for iter in 0..25u64 {
+        let daemon = Daemon::start_with(&dir, 20);
+        {
+            // Après récupération : tout job confirmé est présent, et le total ne dépasse pas ce qui a été envoyé.
+            let mut c = daemon.client();
+            let ids = confirmed.lock().unwrap().clone();
+            for id in &ids {
+                let r = c.call(&Request::GetJob { job_id: *id }).unwrap();
+                assert!(matches!(r, Response::Job(_)), "iter {iter}: job confirmé {id} perdu : {r:?}");
+            }
+            let Response::Stats(s) = c.call(&Request::GetQueueStats { channel_id: Some(1) }).unwrap() else { panic!() };
+            let total = (s.ready + s.claimed + s.completed) as u128;
+            assert!(total >= ids.len() as u128 && total <= sent_max, "iter {iter}: total {total}, confirmés {}, envoyés {sent_max}", ids.len());
+        }
+        let handles: Vec<_> = (0..4u128)
+            .map(|t| {
+                let (mut c, confirmed) = (daemon.client(), confirmed.clone());
+                let base = next_id + t * 100_000;
+                std::thread::spawn(move || {
+                    for k in 0..100_000u128 {
+                        match c.call(&push(base + k)) {
+                            Ok(Response::Push(_)) => confirmed.lock().unwrap().push(base + k),
+                            _ => return base + k,
+                        }
+                    }
+                    base + 100_000
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(40 + (iter * 53) % 260));
+        let data = dir.join("data");
+        with_tmp += usize::from(count_files(&data, &|p| p.extension().is_some_and(|e| e == "tmp")) > 0);
+        with_snaps += usize::from(count_files(&data, &|p| p.extension().is_some_and(|e| e == "snap")) > 0);
+        daemon.sigkill();
+        for h in handles {
+            // Le dernier identifiant tenté par ce thread a pu être écrit sans confirmation.
+            sent_max = sent_max.max(h.join().unwrap());
+        }
+        next_id += 4 * 100_000;
+    }
+    println!(
+        "sigkill_snap: confirmés={} kills avec .tmp visible={with_tmp} avec snapshot publié={with_snaps}",
+        confirmed.lock().unwrap().len()
+    );
 }
