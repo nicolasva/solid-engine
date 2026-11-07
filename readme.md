@@ -137,6 +137,34 @@ Limites connues :
 
 Diagnostics : `SOLID_ENGINE_DISPATCH_TRACE=<fichier>` écrit les temps du dispatcher, du WAL (profondeur de file, fsync, snapshots) et des phases des shards (attente, `apply`, journalisation, réponses). Backlog préchargé (`BENCH_PRELOAD=1`, consommation seule) : 858 k à 956 k jobs/s, ce n'est pas un débit de bout en bout. Ne comparer entre eux que des runs d'un même binaire du banc.
 
+### Mémoire : rétention des jobs terminés et dimensionnement
+
+Un job terminé laisse une entrée `Done` pendant `jobs.completed_retention_ms` (60 000 ms par défaut) : elle sert à la déduplication d'un `PushJob` rejoué, à `GetJob` et au contrôle du fencing. Redis, dans ce banc, supprime le job au `LREM` et ne garde rien : les RSS ne sont pas comparables à fonction égale.
+
+Coût mesuré (Linux/Docker, 4 shards, 2 M de jobs, balanced, `max_jobs_per_shard` = 10 M dans le banc) : ≈ 100 octets par job retenu.
+
+| Part | Octets par job | Origine |
+|---|---:|---|
+| Table `Done` | ≈ 77 | entrée de 40 octets + clé de 16 (emplacement de 56) ÷ remplissage de ≈ 73 % (plafond 3/4) |
+| File de rétention | ≈ 24 | identifiant de 16 octets par tranche, capacité des `VecDeque` comprise |
+
+Ordre de grandeur du régime permanent : **mémoire ≈ débit soutenu × `completed_retention_ms` × ≈ 100 octets** (hors jobs actifs, payloads et allocateur). Exemple théorique, non mesuré à cette échelle : 700 k jobs/s pendant 60 s font ≈ 42 M d'entrées, soit ≈ 4,2 Go.
+
+**La limite `limits.max_jobs_per_shard` (1 000 000 par défaut) borne aussi ce volume**, car les entrées `Done` comptent dans la limite : au-delà, `PushJob` renvoie `Overloaded` (« shard job limit reached »). Avec la valeur par défaut, 4 shards et 60 s de rétention, le débit soutenu est donc plafonné à ≈ 4 M / 60 s ≈ 67 k jobs/s. Les mesures de débit du banc (500 k à 730 k jobs/s) sont des **rafales de 2 M de jobs avec une limite relevée à 10 M par shard**, pas un régime permanent avec les défauts. Pour un débit soutenu élevé, il faut relever la limite et dimensionner la mémoire, ou raccourcir la rétention, qui réduit la fenêtre de déduplication des rejeux.
+
+Cycle de vie du RSS (balanced, 2 producteurs, 512 crédits, 2 M de jobs, un run par configuration, valeurs indicatives) :
+
+| Configuration | RSS stable après la charge | Pic (`VmHWM`) | Données vivantes (`malloc_in_use`) |
+|---|---:|---:|---:|
+| Serveur démarré, sans jobs | 4–18 Mo | — | — |
+| memory | 203 Mo | 203 Mo | ≈ 200 Mo (dont tables mmapées) |
+| balanced | 381–428 Mo | 713–759 Mo | ≈ 200 Mo, + 184–253 Mo libérés mais conservés par glibc |
+| balanced, rétention 2 s | 248 Mo après la purge | 638 Mo | 3 Mo, + ≈ 435 Mo libres côté glibc |
+
+Le RSS ne redescend donc pas après l'expiration des entrées : l'allocateur glibc garde les pages libérées (tampons transitoires de snapshots et de WAL, tables). Ce n'est pas une fuite. Essai diagnostique, sans changement de code : `MALLOC_MMAP_THRESHOLD_=262144` ramène le balanced à 244 Mo de RSS (pic 580 Mo) pour un débit inchangé (712 k jobs/s), sur un seul run ; `MALLOC_ARENA_MAX=1` effondre le débit (118 k jobs/s). Ce réglage n'est pas activé par défaut.
+
+Réserves : un run par configuration ; mesures sur VM Docker Desktop ; l'extrapolation à grande échelle suppose que les ≈ 100 octets par job restent représentatifs.
+
 ## Benchmark (phase 5)
 
 Banc : `../benchmark_solid_engine` (crate indépendante).
