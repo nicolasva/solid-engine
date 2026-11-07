@@ -270,12 +270,75 @@ impl OutMsg {
     }
 }
 
+/// Réponses en file pour le writer d'une connexion. Le lecteur cesse de lire de nouvelles commandes quand
+/// la file atteint `limit` : un client qui n'écrit sans jamais lire ne fait plus grossir la mémoire, et les
+/// shards ne bloquent jamais (seul le thread lecteur de cette connexion attend).
+struct OutQueue {
+    depth: std::sync::atomic::AtomicUsize,
+    closed: std::sync::atomic::AtomicBool,
+    limit: usize,
+    mu: Mutex<()>,
+    cv: Condvar,
+}
+
+static OUT_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Plus grande profondeur de file writer observée dans ce processus (diagnostic et tests).
+pub fn out_queue_peak() -> usize {
+    OUT_PEAK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn out_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("SOLID_ENGINE_OUT_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(8192)
+    })
+}
+
+impl OutQueue {
+    fn done(&self, n: usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let before = self.depth.fetch_sub(n, SeqCst);
+        if before >= self.limit {
+            let _g = self.mu.lock().unwrap();
+            self.cv.notify_all();
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _g = self.mu.lock().unwrap();
+        self.cv.notify_all();
+    }
+}
+
+struct CloseOnDrop(Arc<OutQueue>);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 #[derive(Clone)]
-struct Out(std::sync::mpsc::Sender<OutMsg>);
+struct Out(std::sync::mpsc::Sender<OutMsg>, Arc<OutQueue>);
 
 impl Out {
+    fn push(&self, msg: OutMsg) -> std::result::Result<(), ()> {
+        use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+        let depth = self.1.depth.fetch_add(1, SeqCst) + 1;
+        OUT_PEAK.fetch_max(depth, Relaxed);
+        self.0.send(msg).map_err(|_| {
+            self.1.depth.fetch_sub(1, SeqCst);
+        })
+    }
+
     fn send(&self, f: Frame) -> std::result::Result<(), ()> {
-        self.0.send(OutMsg::Frame(f)).map_err(|_| ())
+        self.push(OutMsg::Frame(f))
     }
 
     fn send_resp(&self, r: Response, ty: u8, id: u64) {
@@ -287,7 +350,21 @@ impl Out {
         } else {
             OutMsg::Frame(r.to_frame(ty, id))
         };
-        let _ = self.0.send(msg);
+        let _ = self.push(msg);
+    }
+
+    /// Attend que la file writer redescende sous la limite ; `false` si le writer s'est arrêté.
+    fn wait_room(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let q = &self.1;
+        if q.depth.load(SeqCst) < q.limit {
+            return !q.closed.load(SeqCst);
+        }
+        let mut g = q.mu.lock().unwrap();
+        while q.depth.load(SeqCst) >= q.limit && !q.closed.load(SeqCst) {
+            g = q.cv.wait_timeout(g, std::time::Duration::from_millis(50)).unwrap().0;
+        }
+        !q.closed.load(SeqCst)
     }
 }
 
@@ -321,10 +398,18 @@ fn serve_connection<R: Read, W: Write + Send + 'static>(
     auth: Option<Arc<Vec<u8>>>,
 ) {
     let (tx, out_rx) = std::sync::mpsc::channel::<OutMsg>();
-    let out = Out(tx);
+    let queue = Arc::new(OutQueue {
+        depth: std::sync::atomic::AtomicUsize::new(0),
+        closed: std::sync::atomic::AtomicBool::new(false),
+        limit: out_limit(),
+        mu: Mutex::new(()),
+        cv: Condvar::new(),
+    });
+    let out = Out(tx, queue.clone());
     let _ = std::thread::Builder::new()
         .name("se-writer".into())
         .spawn(move || {
+            let _close = CloseOnDrop(queue.clone());
             let mut buf = Vec::with_capacity(16 * 1024);
             // Toutes les réponses déjà prêtes partent dans un seul write.
             let mut gate = crate::engine::SpinGate::default();
@@ -374,11 +459,13 @@ fn serve_connection<R: Read, W: Write + Send + 'static>(
                     }
                 };
                 buf.clear();
+                let mut written = 0usize;
                 let mut yielded = false;
                 let mut frame = first;
                 // Grosse trame : écrite avec `buf` en un `writev`, sans recopier son corps.
                 let mut big: Option<Frame> = None;
                 loop {
+                    written += 1;
                     if frame.body.len() >= BIG_FRAME_BYTES {
                         tally.add(crate::stats::C::NetWriterFrames, 1);
                         big = Some(frame);
@@ -433,6 +520,7 @@ fn serve_connection<R: Read, W: Write + Send + 'static>(
                         crate::stats::thread_cpu_ns().saturating_sub(t0),
                     );
                 }
+                queue.done(written);
                 if failed {
                     break;
                 }
@@ -451,6 +539,9 @@ fn serve_connection<R: Read, W: Write + Send + 'static>(
     let mut sub: Option<Arc<Subscription>> = None;
     let _stop_sub = StopOnDrop(&mut sub as *mut _);
     loop {
+        if !out.wait_room() {
+            return;
+        }
         let frame = match read_frame(&mut reader, max_body) {
             Ok(f) => f,
             Err(ProtocolError::Eof) | Err(ProtocolError::Io(_)) => return,

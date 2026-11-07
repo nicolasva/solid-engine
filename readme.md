@@ -131,7 +131,7 @@ Ce qui a changé le chemin balanced à plusieurs producteurs (comparaisons appar
 
 Limites connues :
 
-- **La file de réponses du writer n'est pas bornée**, avant comme après le changement : `in_flight` est libéré dès l'envoi dans la file, donc un client qui n'envoie que sans lire fait grossir la mémoire du serveur (≈ +120 Mo pour 300 000 réponses). Le test `slow_client` vérifie que toutes les réponses reviennent une fois, sans fuite après déconnexion ; une limite par connexion reste à concevoir.
+- **File de réponses bornée par connexion** : le thread lecteur cesse de lire de nouvelles commandes quand ≥ `SOLID_ENGINE_OUT_LIMIT` réponses (8192 par défaut) attendent l'écriture ; les shards ne bloquent jamais. Un client qui envoie 300 000 requêtes sans lire fait monter le RSS de ≈ 24 Mo (contre ≈ 120 Mo sans limite) et le pic de file reste ≈ limite + 256 (`slow_client`). Débit inchangé (6 paires, 1 producteur : 505 k avec limite, 507 k sans). Le budget compte des réponses, pas des octets : des réponses volumineuses (`Dispatch` de gros jobs) bornent moins bien la mémoire. Un client qui n'écrit sans jamais lire se bloque lui-même (fenêtre TCP) : il doit lire en parallèle.
 - **Stall intermittent d'environ 3,6 s** au vidage après une longue pause de lecture (1 run sur 10 dans chaque variante), cause inconnue.
 - Mesures Linux sous Docker uniquement ; macOS non retesté après ces changements.
 

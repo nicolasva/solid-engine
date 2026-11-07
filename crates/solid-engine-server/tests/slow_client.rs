@@ -76,6 +76,11 @@ fn client_that_stops_reading_gets_every_response_once_it_resumes() {
     let drain = start.elapsed();
     assert!(seen[1..].iter().all(|s| *s));
     drop(sender.join().unwrap());
+    let peak = solid_engine_server::net::out_queue_peak();
+    assert!(peak <= 8192 + 1024, "file writer non bornée : pic de {peak} réponses");
+    println!(
+        "slow_client: peak_queue={peak}"
+    );
     println!(
         "slow_client: rss_start={}MB rss_stalled={}MB (+{}MB) first={:?} drain={:?} cpu_ms={}",
         rss0 / 1024,
@@ -120,13 +125,32 @@ fn disconnect_while_responses_pile_up_releases_the_connection() {
     for cycle in 0..5u64 {
         let stream = TcpStream::connect(addr).unwrap();
         let mut w = BufWriter::new(stream.try_clone().unwrap());
-        for i in 1..=N {
-            write_frame(&mut w, &push(i).to_frame(i)).unwrap();
-        }
-        std::io::Write::flush(&mut w).unwrap();
+        // Le serveur cesse de lire quand la file de réponses est pleine : l'écriture se bloque jusqu'à la fermeture.
+        let sender = std::thread::spawn(move || {
+            for i in 1..=N {
+                if write_frame(&mut w, &Request::PushJob(PushRequest {
+                    job_id: i as u128,
+                    channel_id: 1,
+                    priority: 0,
+                    max_attempts: 0,
+                    delay_ms: 0,
+                    partition_key: vec![],
+                    payload: vec![0u8; 16],
+                }).to_frame(i)).is_err() {
+                    return;
+                }
+            }
+            let _ = std::io::Write::flush(&mut w);
+        });
         std::thread::sleep(Duration::from_secs(2));
         let rss_full = rss_kb();
-        drop(w);
+        // Pendant la saturation, une autre connexion reste servie.
+        let mut other = TcpStream::connect(addr).unwrap();
+        write_frame(&mut other, &push(20_000_000 + cycle).to_frame(9)).unwrap();
+        let f = read_frame(&mut other, 1 << 20).unwrap();
+        assert_eq!(f.request_id, 9);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        sender.join().unwrap();
         drop(stream);
         std::thread::sleep(Duration::from_secs(2));
         rss_after.push(rss_kb() / 1024);
@@ -144,5 +168,6 @@ fn disconnect_while_responses_pile_up_releases_the_connection() {
         assert!(matches!(Response::decode(f.msg_type, &f.body).unwrap(), Response::Push(_)));
     }
     assert!(threads() <= threads0 + 2, "threads de connexion non libérés");
+    assert!(solid_engine_server::net::out_queue_peak() <= 8192 + 1024, "file writer non bornée");
     server.shutdown();
 }
