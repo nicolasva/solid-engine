@@ -171,3 +171,87 @@ fn disconnect_while_responses_pile_up_releases_the_connection() {
     assert!(solid_engine_server::net::out_queue_peak() <= 8192 + 1024, "file writer non bornée");
     server.shutdown();
 }
+
+fn dump_state(port: u16) {
+    let hex = format!(":{port:04X}");
+    for f in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        for l in std::fs::read_to_string(f).unwrap_or_default().lines() {
+            if l.contains(&hex) {
+                println!("  {f}: {}", l.split_whitespace().take(9).collect::<Vec<_>>().join(" "));
+            }
+        }
+    }
+    for e in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
+        let p = e.path();
+        let comm = std::fs::read_to_string(p.join("comm")).unwrap_or_default();
+        let wchan = std::fs::read_to_string(p.join("wchan")).unwrap_or_default();
+        let st = std::fs::read_to_string(p.join("stat")).unwrap_or_default();
+        let state = st.rsplit(')').next().unwrap_or("").split_whitespace().next().unwrap_or("?").to_string();
+        println!("  thread {} state={state} wchan={wchan}", comm.trim());
+    }
+}
+
+/// Diagnostic du stall de vidage : répète le scénario et, quand la lecture ne progresse plus pendant 500 ms,
+/// affiche l'état TCP (`tr` = 4 : minuteur de sondage de fenêtre nulle) et celui des threads.
+/// `cargo test --release --test slow_client stall_probe -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn stall_probe() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    use std::sync::Arc;
+    for cycle in 0..20 {
+        let mut cfg = Config::default();
+        cfg.server.tcp_addr = Some("127.0.0.1:0".into());
+        cfg.storage.durability = Durability::Memory;
+        let server = Server::start(cfg).unwrap();
+        let addr = server.tcp_addr().unwrap();
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut reader = stream.try_clone().unwrap();
+        let sender = std::thread::spawn(move || {
+            let mut w = BufWriter::new(stream);
+            for id in 1..=N {
+                let req = Request::PushJob(PushRequest {
+                    job_id: id as u128, channel_id: 1, priority: 0, max_attempts: 0,
+                    delay_ms: 0, partition_key: vec![], payload: vec![0u8; 16],
+                });
+                write_frame(&mut w, &req.to_frame(id)).unwrap();
+            }
+            std::io::Write::flush(&mut w).unwrap();
+            w
+        });
+        std::thread::sleep(Duration::from_secs(4));
+        let count = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let mon = {
+            let (count, done) = (count.clone(), done.clone());
+            std::thread::spawn(move || {
+                let (mut last, mut since, mut dumped) = (0u64, Instant::now(), false);
+                while !done.load(Relaxed) {
+                    std::thread::sleep(Duration::from_millis(100));
+                    let c = count.load(Relaxed);
+                    if c != last {
+                        (last, since, dumped) = (c, Instant::now(), false);
+                    } else if !dumped && c > 0 && since.elapsed() > Duration::from_millis(500) {
+                        dumped = true;
+                        println!("cycle {cycle}: plus de progression après {c} réponses");
+                        dump_state(addr.port());
+                    }
+                }
+            })
+        };
+        let start = Instant::now();
+        let (mut maxgap, mut at, mut prev) = (Duration::ZERO, 0u64, Instant::now());
+        for i in 0..N {
+            read_frame(&mut reader, 1 << 20).unwrap();
+            let g = prev.elapsed();
+            if g > maxgap { (maxgap, at) = (g, i); }
+            prev = Instant::now();
+            count.store(i + 1, Relaxed);
+        }
+        done.store(true, Relaxed);
+        mon.join().unwrap();
+        println!("cycle {cycle}: drain={:?} max_gap={maxgap:?} at={at}", start.elapsed());
+        drop(sender.join().unwrap());
+        server.shutdown();
+    }
+}
