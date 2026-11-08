@@ -213,7 +213,9 @@ impl Wal {
     /// Écrit un snapshot de l'état courant (tous les enregistrements déjà ajoutés y sont inclus),
     /// ouvre un nouveau segment puis supprime l'historique devenu inutile.
     pub fn snapshot(&mut self, state: &[u8]) -> io::Result<()> {
-        let delay = SNAPSHOT_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
+        static ENV_DELAY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let env = *ENV_DELAY.get_or_init(|| std::env::var("SOLID_ENGINE_TEST_SNAPSHOT_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        let delay = SNAPSHOT_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed).max(env);
         if delay > 0 {
             std::thread::sleep(std::time::Duration::from_millis(delay));
         }
