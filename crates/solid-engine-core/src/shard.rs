@@ -162,6 +162,10 @@ pub struct Shard {
 }
 
 impl Shard {
+    pub fn id(&self) -> u16 {
+        self.id
+    }
+
     pub fn new(id: u16, cfg: Arc<Config>) -> Self {
         Self {
             id,
@@ -592,7 +596,10 @@ impl Shard {
     /// État complet du shard (jobs, réservations actives, fencing tokens, échéances).
     /// Les compteurs cumulatifs de `Stats` ne sont pas persistés.
     pub fn encode_snapshot(&self) -> Vec<u8> {
-        let mut w = Wr::default();
+        // Taille exacte : 24 octets d'en-tête, puis 92 octets fixes par job (Done ou actif) et les payloads.
+        let payloads: usize = self.jobs.values().map(|j| j.payload.len()).sum();
+        let expected = 24 + 92 * (self.jobs.len() + self.done.len()) + payloads;
+        let mut w = Wr(Vec::with_capacity(expected));
         w.u64(self.next_reservation);
         w.u64(self.next_seq);
         w.u64((self.jobs.len() + self.done.len()) as u64);
@@ -631,6 +638,7 @@ impl Shard {
             w.u32(j.payload_len);
             w.bytes(&j.payload);
         }
+        debug_assert_eq!(w.0.len(), expected);
         w.0
     }
 

@@ -1226,7 +1226,41 @@ enum WalMsg {
 #[doc(hidden)]
 pub static SNAPSHOTS_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[doc(hidden)]
+/// Diagnostic mémoire (camp33) : octets encodés / capacités des buffers de snapshot, en vol et au maximum.
+pub static SNAP_LEN_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static SNAP_CAP_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static SNAP_LIVE_CAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static SNAP_LIVE_CAP_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static SNAP_COPY_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static SNAP_TOTAL_LIVE_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static SNAP_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static SNAPSHOTS_IN_FLIGHT_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Limite globale expérimentale (`SOLID_ENGINE_SNAPSHOT_MAX_CONCURRENT`, 0 = illimité, défaut) de snapshots
+/// simultanés (encodage, file du writer et écriture) pour les shards qui passent par le writer.
+/// Un shard qui n'obtient pas de place reporte son snapshot au prochain lot, sans jamais attendre.
+fn snapshot_gate_limit() -> usize {
+    static L: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *L.get_or_init(|| std::env::var("SOLID_ENGINE_SNAPSHOT_MAX_CONCURRENT").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+pub static SNAP_GATE_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static SNAP_GATE_DEFERRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static SNAP_BACKLOG_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SNAP_ENCODING_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static SNAP_ENCODING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static SNAP_DEFERRED_BY_SHARD: [std::sync::atomic::AtomicUsize; 16] = [const { std::sync::atomic::AtomicUsize::new(0) }; 16];
+pub static SNAP_DONE_BY_SHARD: [std::sync::atomic::AtomicUsize; 16] = [const { std::sync::atomic::AtomicUsize::new(0) }; 16];
+
+fn snapshot_gate_acquire() -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    let limit = snapshot_gate_limit();
+    SNAP_GATE_ACTIVE.fetch_update(SeqCst, SeqCst, |n| (n < limit).then_some(n + 1)).is_ok()
+}
+fn snapshot_gate_release() {
+    if snapshot_gate_limit() > 0 {
+        SNAP_GATE_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// Modes `balanced` et `strict` : un thread unique possède le WAL (encodage, écriture, fsync).
 /// En `balanced` le shard répond sans attendre le disque ; en `strict` les réponses sont
@@ -1237,6 +1271,11 @@ pub static SNAPSHOTS_IN_FLIGHT_MAX: std::sync::atomic::AtomicUsize = std::sync::
 pub static LAG_SENT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 pub static LAG_WRITTEN: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 pub static LAG_SYNCED: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+pub static BYTES_SENT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+pub static BYTES_WRITTEN: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+/// Maximum observé de (octets envoyés non écrits + fournée en cours d'envoi) et taille maximale d'une fournée.
+pub static BYTES_PEND_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BYTES_BATCH_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BP_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LAG_SNAP: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 
@@ -1250,7 +1289,15 @@ fn start_lag_printer(shards: usize) {
             let t0 = Instant::now();
             loop {
                 std::thread::sleep(Duration::from_millis(100));
-                let mut line = format!("wal_lag t={} bp={}", t0.elapsed().as_millis(), BP_WAIT_US.load(std::sync::atomic::Ordering::Relaxed));
+                let l = std::sync::atomic::Ordering::Relaxed;
+                let mut line = format!(
+                    "wal_lag t={} bp={} pbmax={} bbmax={} bw={}",
+                    t0.elapsed().as_millis(),
+                    BP_WAIT_US.load(l),
+                    BYTES_PEND_MAX.load(l),
+                    BYTES_BATCH_MAX.load(l),
+                    (0..shards.min(16)).map(|i| BYTES_WRITTEN[i].load(l)).sum::<u64>()
+                );
                 for i in 0..shards.min(16) {
                     let l = std::sync::atomic::Ordering::Relaxed;
                     line += &format!(" {i}:{},{},{},{}", LAG_SENT[i].load(l), LAG_WRITTEN[i].load(l), LAG_SYNCED[i].load(l), LAG_SNAP[i].load(l));
@@ -1326,6 +1373,10 @@ impl WalWriter {
                                 }
                                 match r {
                                     Ok(()) => {
+                                        BYTES_WRITTEN[shard_id].fetch_add(
+                                            records.iter().map(|r| r.wire_len()).sum::<u64>(),
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
                                         LAG_WRITTEN[shard_id].store(wal.last_seq(), std::sync::atomic::Ordering::Relaxed);
                                         due = due.or(Some(Instant::now() + sync_interval))
                                     }
@@ -1382,7 +1433,16 @@ impl WalWriter {
                         Ok(WalMsg::Snapshot(state)) => {
                             if slot.lock().unwrap().is_none() {
                                 let t0 = wal_trace::on().then(Instant::now);
-                                match wal.snapshot(&state) {
+                                // `Wal::snapshot` n'effectue plus de copie complète de l'état.
+                                let copy = 0usize;
+                                {
+                                    use std::sync::atomic::Ordering::Relaxed;
+                                    let c = SNAP_COPY_LIVE.fetch_add(copy, Relaxed) + copy;
+                                    SNAP_TOTAL_LIVE_MAX.fetch_max(c + SNAP_LIVE_CAP.load(Relaxed), Relaxed);
+                                }
+                                let snap_result = wal.snapshot(&state);
+                                SNAP_COPY_LIVE.fetch_sub(copy, std::sync::atomic::Ordering::Relaxed);
+                                match snap_result {
                                     Ok(()) => {
                                         due = None;
                                         LAG_SNAP[shard_id].store(wal.last_seq(), std::sync::atomic::Ordering::Relaxed);
@@ -1394,8 +1454,11 @@ impl WalWriter {
                                 }
                             }
                             // Libéré sur tous les chemins ; une erreur d'écriture reste publiée par `fail`.
+                            SNAP_LIVE_CAP.fetch_sub(state.capacity(), std::sync::atomic::Ordering::Relaxed);
                             drop(state);
                             SNAPSHOTS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            SNAP_DONE_BY_SHARD[shard_id.min(15)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            snapshot_gate_release();
                             writer_flag.store(false, std::sync::atomic::Ordering::Release);
                         }
                         Err(RecvTimeoutError::Timeout) => {
@@ -1432,21 +1495,29 @@ impl WalWriter {
     /// EXPERIMENTAL (camp29) : borne le nombre de records envoyés mais pas encore écrits par shard
     /// (SOLID_ENGINE_WAL_MAX_PENDING_RECORDS, 0 = illimité). Le writer ne dépend jamais du shard : pas d'interblocage.
     /// Le seuil peut être dépassé d'une fournée au plus.
+    /// Attend que le retard du writer repasse sous les plafonds (records et/ou octets). Plafond souple :
+    /// la fournée qui suit est envoyée dès que le retard est sous le plafond, donc le retard peut dépasser
+    /// le plafond d'au plus une fournée. Une fournée plus grosse que le plafond passe quand le retard est nul.
     fn wait_for_capacity(&self) {
-        static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let max = *MAX.get_or_init(|| {
-            std::env::var("SOLID_ENGINE_WAL_MAX_PENDING_RECORDS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        static MAX: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+        let (max_rec, max_bytes) = *MAX.get_or_init(|| {
+            let get = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            (get("SOLID_ENGINE_WAL_MAX_PENDING_RECORDS"), get("SOLID_ENGINE_WAL_MAX_PENDING_BYTES"))
         });
-        if max == 0 {
+        if max_rec == 0 && max_bytes == 0 {
             return;
         }
         let l = std::sync::atomic::Ordering::Relaxed;
-        let pending = || LAG_SENT[self.shard_id].load(l).saturating_sub(LAG_WRITTEN[self.shard_id].load(l));
-        if pending() <= max {
+        let over = || {
+            (max_rec > 0 && LAG_SENT[self.shard_id].load(l).saturating_sub(LAG_WRITTEN[self.shard_id].load(l)) > max_rec)
+                || (max_bytes > 0
+                    && BYTES_SENT[self.shard_id].load(l).saturating_sub(BYTES_WRITTEN[self.shard_id].load(l)) > max_bytes)
+        };
+        if !over() {
             return;
         }
         let t0 = Instant::now();
-        while pending() > max {
+        while over() {
             // Un writer en échec n'écrit plus : on laisse passer pour que l'erreur soit publiée.
             if self.take_error().is_some() || self.handle.as_ref().is_none_or(|h| h.is_finished()) {
                 break;
@@ -1579,7 +1650,12 @@ pub(crate) fn flush(
                         wal_trace::before_send();
                     }
                     w.wait_for_capacity();
-                    LAG_SENT[w.shard_id].fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+                    let l = std::sync::atomic::Ordering::Relaxed;
+                    let bytes: u64 = records.iter().map(|r| r.wire_len()).sum();
+                    let sent_b = BYTES_SENT[w.shard_id].fetch_add(bytes, l) + bytes;
+                    BYTES_PEND_MAX.fetch_max(sent_b.saturating_sub(BYTES_WRITTEN[w.shard_id].load(l)), l);
+                    BYTES_BATCH_MAX.fetch_max(bytes, l);
+                    LAG_SENT[w.shard_id].fetch_add(count, l);
                     let sent =
                         w.tx.as_ref()
                             .is_some_and(|tx| tx.send(WalMsg::Append(records)).is_ok());
@@ -1611,15 +1687,40 @@ pub(crate) fn flush(
         // suit sa fin, puis le compteur repart de zéro.
         let busy = d.single_flight
             && d.writer.as_ref().is_some_and(|w| w.snapshot_in_flight.load(std::sync::atomic::Ordering::Acquire));
-        if failed.is_none() && every > 0 && d.since_snapshot >= every && !busy {
+        let due_now = failed.is_none() && every > 0 && d.since_snapshot >= every && !busy;
+        if due_now {
+            SNAP_BACKLOG_MAX.fetch_max(d.since_snapshot, std::sync::atomic::Ordering::Relaxed);
+        }
+        let gated = due_now && d.writer.is_some() && snapshot_gate_limit() > 0;
+        let admitted = !gated || snapshot_gate_acquire();
+        if gated && !admitted {
+            SNAP_GATE_DEFERRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SNAP_DEFERRED_BY_SHARD[(shard.id() as usize).min(15)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if due_now && admitted {
             let t_snap = Instant::now();
+            let enc = SNAP_ENCODING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            SNAP_ENCODING_MAX.fetch_max(enc, std::sync::atomic::Ordering::Relaxed);
             let state = shard.encode_snapshot();
+            SNAP_ENCODING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                SNAP_LEN_MAX.fetch_max(state.len(), Relaxed);
+                SNAP_CAP_MAX.fetch_max(state.capacity(), Relaxed);
+                SNAP_COUNT.fetch_add(1, Relaxed);
+                let live = SNAP_LIVE_CAP.fetch_add(state.capacity(), Relaxed) + state.capacity();
+                SNAP_LIVE_CAP_MAX.fetch_max(live, Relaxed);
+            }
             wal_trace::snapshot_encode(t_snap.elapsed());
             let result = if let Some(w) = &d.writer {
                 // Le shard n'attend pas l'I/O : une erreur du writer remonte par `take_error`.
                 // Diagnostic : encode puis abandonne, pour isoler le coût de l'I/O du snapshot.
                 let sent = if std::env::var_os("SOLID_ENGINE_SNAPSHOT_SKIP_IO").is_some() {
+                    SNAP_LIVE_CAP.fetch_sub(state.capacity(), std::sync::atomic::Ordering::Relaxed);
                     drop(state);
+                    if gated {
+                        snapshot_gate_release();
+                    }
                     Some(Ok(()))
                 } else {
                     w.snapshot_in_flight.store(true, std::sync::atomic::Ordering::Release);
@@ -1628,6 +1729,9 @@ pub(crate) fn flush(
                     let sent = w.tx.as_ref().map(|tx| tx.send(WalMsg::Snapshot(state)));
                     if !matches!(sent, Some(Ok(()))) {
                         SNAPSHOTS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        if gated {
+                            snapshot_gate_release();
+                        }
                         w.snapshot_in_flight.store(false, std::sync::atomic::Ordering::Release);
                     }
                     sent

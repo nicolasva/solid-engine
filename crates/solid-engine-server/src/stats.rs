@@ -255,16 +255,37 @@ fn rss_bytes() -> usize {
         .map_or(0, |pages| pages * 4096)
 }
 
+fn snap_stats() -> String {
+    use crate::engine::*;
+    use std::sync::atomic::Ordering::Relaxed;
+    format!(
+        "snap_n={} snap_len_max={} snap_cap_max={} snap_live_cap={} snap_live_cap_max={} snap_copy_live={} snap_total_live_max={} snap_gate_deferred={} snap_backlog_max={} snap_encoding_max={} snap_inflight_max={} snap_def_by_shard={} snap_done_by_shard={}",
+        SNAP_COUNT.load(Relaxed),
+        SNAP_LEN_MAX.load(Relaxed),
+        SNAP_CAP_MAX.load(Relaxed),
+        SNAP_LIVE_CAP.load(Relaxed),
+        SNAP_LIVE_CAP_MAX.load(Relaxed),
+        SNAP_COPY_LIVE.load(Relaxed),
+        SNAP_TOTAL_LIVE_MAX.load(Relaxed),
+        SNAP_GATE_DEFERRED.load(Relaxed),
+        SNAP_BACKLOG_MAX.load(Relaxed),
+        SNAP_ENCODING_MAX.load(Relaxed),
+        SNAPSHOTS_IN_FLIGHT_MAX.load(Relaxed),
+        SNAP_DEFERRED_BY_SHARD.iter().take(4).map(|a| a.load(Relaxed).to_string()).collect::<Vec<_>>().join("/"),
+        SNAP_DONE_BY_SHARD.iter().take(4).map(|a| a.load(Relaxed).to_string()).collect::<Vec<_>>().join("/")
+    )
+}
+
 /// RSS et état de l'allocateur glibc (octets) : `in_use` = alloué, `free_held` = libéré mais conservé par l'allocateur.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn process_memory() -> String {
     // SAFETY : appel sans argument, structure renvoyée par valeur.
     let m = unsafe { mallinfo2() };
     use std::sync::atomic::Ordering::Relaxed;
-    format!("rss_bytes={} malloc_in_use={} malloc_free_held={} malloc_arena={} malloc_mmapped={} trims={} trim_max_us={}", rss_bytes(), m.uordblks, m.fordblks, m.arena, m.hblkhd, TRIMS.load(Relaxed), TRIM_MAX_US.load(Relaxed))
+    format!("rss_bytes={} malloc_in_use={} malloc_free_held={} malloc_arena={} malloc_mmapped={} trims={} trim_max_us={} {}", rss_bytes(), m.uordblks, m.fordblks, m.arena, m.hblkhd, TRIMS.load(Relaxed), TRIM_MAX_US.load(Relaxed), snap_stats())
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 pub fn process_memory() -> String {
-    format!("rss_bytes={}", rss_bytes())
+    format!("rss_bytes={} {}", rss_bytes(), snap_stats())
 }

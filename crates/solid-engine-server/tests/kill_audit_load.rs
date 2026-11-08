@@ -35,6 +35,9 @@ struct Lag {
     sum: u64,
     max: u64,
     bp_us: u64,
+    pbmax: u64,
+    bbmax: u64,
+    bw: u64,
 }
 
 struct Daemon {
@@ -71,6 +74,8 @@ impl Daemon {
             for line in BufReader::new(err).lines().map_while(|l| l.ok()) {
                 let Some(rest) = line.strip_prefix("wal_lag ") else { continue };
                 let bp = rest.split(' ').find_map(|t| t.strip_prefix("bp=")).and_then(|v| v.parse().ok()).unwrap_or(0);
+                let tok = |k: &str| rest.split(' ').find_map(|t| t.strip_prefix(k)).and_then(|v| v.parse().ok()).unwrap_or(0u64);
+                let (pbmax, bbmax, bw) = (tok("pbmax="), tok("bbmax="), tok("bw="));
                 let mut last = Vec::new();
                 for tok in rest.split(' ').skip(1) {
                     let Some((_, v)) = tok.split_once(':') else { continue };
@@ -85,6 +90,7 @@ impl Daemon {
                 g.sum += total;
                 g.max = g.max.max(total);
                 g.bp_us = bp;
+                (g.pbmax, g.bbmax, g.bw) = (pbmax, bbmax, bw);
                 g.last = last;
             }
         });
@@ -318,6 +324,7 @@ fn run(label: &str, durability: &str, every: u64, sf: bool, delay_ms: u64, run_m
     let lag = daemon.lag.lock().unwrap();
     let last = lag.last.clone();
     let (lag_mean, lag_max, bp_ms) = (lag.sum / lag.samples.max(1), lag.max, lag.bp_us / 1000);
+    let (pbmax, bbmax, bw) = (lag.pbmax, lag.bbmax, lag.bw);
     drop(lag);
 
     let disk = read_disk(&dir.join("data"));
@@ -369,7 +376,7 @@ fn run(label: &str, durability: &str, every: u64, sf: bool, delay_ms: u64, run_m
          PUSH_PERDUS={lost} [record_valide_sur_disque={lost_valid_rec} motif_snapshot={lost_snap_pat}] queue_max={max_tail} ({:.0} ms) | \
          ACKS absents={ack_absent} autre_état={ack_other} [record_ack_valide_sur_disque={ack_valid_rec_not_done}] | \
          récupérés={recovered} inattendus={} | retard_writer mean={lag_mean} max={lag_max} records | records_envoyés_non_écrits_au_kill≈{unwritten} |{frontier} | \
-         wal_torn_bytes={} crc_invalides={} disque={:.0}Mo prêt={ready_s:.1}s | lat_batch_ms p50={:.1} p99={:.1} p99.9={:.1} | VmHWM={}Mo attente_backpressure={bp_ms}ms",
+         wal_torn_bytes={} crc_invalides={} disque={:.0}Mo prêt={ready_s:.1}s | lat_batch_ms p50={:.1} p99={:.1} p99.9={:.1} | VmHWM={}Mo attente_backpressure={bp_ms}ms | octets_pend_max={} lot_max={} octets_écrits={} octets_par_record={:.1}",
         acked_ack.len(),
         max_tail as f64 / rate_real * 1000.0,
         recovered as i64 - (total - lost) as i64,
@@ -380,6 +387,10 @@ fn run(label: &str, durability: &str, every: u64, sf: bool, delay_ms: u64, run_m
         q(0.99),
         q(0.999),
         hwm / 1024,
+        pbmax,
+        bbmax,
+        bw,
+        bw as f64 / last.iter().take(SHARDS).map(|s| s[1]).sum::<u64>().max(1) as f64,
     );
 }
 
