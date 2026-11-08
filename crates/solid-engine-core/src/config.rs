@@ -31,11 +31,14 @@ pub struct StorageConfig {
     pub sync_interval_ms: u64,
     /// Nombre d'enregistrements WAL d'un shard déclenchant un snapshot (0 = jamais).
     pub snapshot_every_records: u64,
+    /// Un seul snapshot en vol par shard (mode `balanced`) : le shard n'en encode pas de nouveau tant que
+    /// le writer n'a pas terminé le précédent. Désactivé par défaut ; `SOLID_ENGINE_SNAPSHOT_SINGLE_FLIGHT=1|0` prime.
+    pub snapshot_single_flight: bool,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
-        Self { durability: Durability::Memory, data_dir: None, sync_interval_ms: 10, snapshot_every_records: 100_000 }
+        Self { durability: Durability::Memory, data_dir: None, sync_interval_ms: 10, snapshot_every_records: 100_000, snapshot_single_flight: false }
     }
 }
 
