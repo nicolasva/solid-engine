@@ -89,12 +89,16 @@ impl Daemon {
     }
 
     fn start_with(dir: &PathBuf, snapshot_every_records: u64) -> Self {
+        Self::start_cfg(dir, snapshot_every_records, "strict", false)
+    }
+
+    fn start_cfg(dir: &PathBuf, snapshot_every_records: u64, durability: &str, single_flight: bool) -> Self {
         // Nom court : `sun_path` est limité à 104 octets sur macOS et `$TMPDIR` y est déjà long.
         let sock = dir.join("e.sock");
         let cfg_path = dir.join("engine.toml");
         let toml = format!(
             "[engine]\nshards = 2\n\n[server]\ntcp_addr = \"127.0.0.1:0\"\nunix_socket = \"{}\"\n\n\
-             [storage]\ndurability = \"strict\"\ndata_dir = \"{}\"\nsnapshot_every_records = {}\n",
+             [storage]\ndurability = \"{durability}\"\ndata_dir = \"{}\"\nsnapshot_every_records = {}\nsnapshot_single_flight = {single_flight}\n",
             sock.display(),
             dir.join("data").display(),
             snapshot_every_records
@@ -226,4 +230,58 @@ fn sigkill_during_continuous_snapshots_loses_no_confirmed_push() {
         "sigkill_snap: confirmés={} kills avec .tmp visible={with_tmp} avec snapshot publié={with_snaps}",
         confirmed.lock().unwrap().len()
     );
+}
+
+/// Même scénario en `balanced` avec un seul snapshot en vol par shard. L'acquittement précède le fsync : un job confirmé
+/// peut disparaître avec le dernier lot non synchronisé, la perte doit rester marginale. Surtout, la récupération
+/// réussit toujours et ne fabrique aucun job qui n'a pas été envoyé.
+#[test]
+fn sigkill_during_continuous_snapshots_balanced_single_flight_recovers_consistently() {
+    use std::sync::{Arc, Mutex};
+    let dir = temp_dir("sigkill-snap-bal");
+    let confirmed: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
+    let (mut next_id, mut sent_max) = (1u128, 0u128);
+    let (mut lost_total, mut checked_total) = (0usize, 0usize);
+    for iter in 0..12u64 {
+        let daemon = Daemon::start_cfg(&dir, 20, "balanced", true);
+        {
+            let mut c = daemon.client();
+            let mut ids = confirmed.lock().unwrap();
+            let mut kept = Vec::with_capacity(ids.len());
+            for id in ids.iter() {
+                match c.call(&Request::GetJob { job_id: *id }).unwrap() {
+                    Response::Job(_) => kept.push(*id),
+                    _ => lost_total += 1,
+                }
+            }
+            checked_total += ids.len();
+            *ids = kept;
+            let Response::Stats(s) = c.call(&Request::GetQueueStats { channel_id: Some(1) }).unwrap() else { panic!() };
+            let total = (s.ready + s.claimed + s.completed) as u128;
+            assert!(total <= sent_max, "iter {iter}: {total} jobs récupérés pour {sent_max} envoyés");
+        }
+        let handles: Vec<_> = (0..4u128)
+            .map(|t| {
+                let (mut c, confirmed) = (daemon.client(), confirmed.clone());
+                let base = next_id + t * 100_000;
+                std::thread::spawn(move || {
+                    for k in 0..100_000u128 {
+                        match c.call(&push(base + k)) {
+                            Ok(Response::Push(_)) => confirmed.lock().unwrap().push(base + k),
+                            _ => return base + k,
+                        }
+                    }
+                    base + 100_000
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(40 + (iter * 53) % 260));
+        daemon.sigkill();
+        for h in handles {
+            sent_max = sent_max.max(h.join().unwrap());
+        }
+        next_id += 4 * 100_000;
+    }
+    println!("sigkill_snap_balanced: vérifiés={checked_total} perdus (non synchronisés)={lost_total}");
+    assert!(lost_total * 20 <= checked_total.max(1), "perte non marginale : {lost_total}/{checked_total}");
 }

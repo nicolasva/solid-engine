@@ -1222,6 +1222,12 @@ enum WalMsg {
     Snapshot(Vec<u8>),
 }
 
+/// Tests : snapshots envoyés au writer et non terminés (tous shards), et maximum observé.
+#[doc(hidden)]
+pub static SNAPSHOTS_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[doc(hidden)]
+pub static SNAPSHOTS_IN_FLIGHT_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Modes `balanced` et `strict` : un thread unique possède le WAL (encodage, écriture, fsync).
 /// En `balanced` le shard répond sans attendre le disque ; en `strict` les réponses sont
 /// transmises au writer, qui les libère après un fsync commun à toutes les soumissions en attente.
@@ -1231,6 +1237,10 @@ struct WalWriter {
     tx: Option<std::sync::mpsc::SyncSender<WalMsg>>,
     error: Arc<std::sync::Mutex<Option<String>>>,
     handle: Option<std::thread::JoinHandle<()>>,
+    /// Vrai de l'envoi d'un snapshot jusqu'à la fin de son traitement par le writer (succès ou échec).
+    /// Un seul snapshot par shard est en vol : sans cela, des snapshots complets s'empilent
+    /// dans la file quand le disque est plus lent que la production, et la mémoire n'est pas bornée.
+    snapshot_in_flight: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WalWriter {
@@ -1239,6 +1249,8 @@ impl WalWriter {
         let (tx, rx) = std::sync::mpsc::sync_channel::<WalMsg>(65_536);
         let error = Arc::new(std::sync::Mutex::new(None::<String>));
         let slot = error.clone();
+        let in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_flag = in_flight.clone();
         let handle = std::thread::Builder::new()
             .name(format!("solid-engine-wal-{shard_id}"))
             .spawn(move || {
@@ -1335,6 +1347,10 @@ impl WalWriter {
                                     wal_trace::snapshot_io(t0.elapsed());
                                 }
                             }
+                            // Libéré sur tous les chemins ; une erreur d'écriture reste publiée par `fail`.
+                            drop(state);
+                            SNAPSHOTS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            writer_flag.store(false, std::sync::atomic::Ordering::Release);
                         }
                         Err(RecvTimeoutError::Timeout) => {
                             due = None;
@@ -1360,6 +1376,7 @@ impl WalWriter {
             tx: Some(tx),
             error,
             handle: Some(handle),
+            snapshot_in_flight: in_flight,
         }
     }
 
@@ -1383,6 +1400,7 @@ pub(crate) struct Durable {
     writer: Option<WalWriter>,
     mode: Durability,
     since_snapshot: u64,
+    single_flight: bool,
 }
 
 fn open_shard(
@@ -1423,6 +1441,8 @@ fn open_shard(
             writer,
             mode,
             since_snapshot,
+            single_flight: std::env::var("SOLID_ENGINE_SNAPSHOT_SINGLE_FLIGHT")
+                .map_or(storage.snapshot_single_flight, |v| v == "1"),
         }),
     ))
 }
@@ -1508,7 +1528,11 @@ pub(crate) fn flush(
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(cfg.storage.snapshot_every_records);
-        if failed.is_none() && every > 0 && d.since_snapshot >= every {
+        // `since_snapshot` continue de croître tant qu'un snapshot est en vol : un seul nouveau snapshot
+        // suit sa fin, puis le compteur repart de zéro.
+        let busy = d.single_flight
+            && d.writer.as_ref().is_some_and(|w| w.snapshot_in_flight.load(std::sync::atomic::Ordering::Acquire));
+        if failed.is_none() && every > 0 && d.since_snapshot >= every && !busy {
             let t_snap = Instant::now();
             let state = shard.encode_snapshot();
             wal_trace::snapshot_encode(t_snap.elapsed());
@@ -1519,7 +1543,15 @@ pub(crate) fn flush(
                     drop(state);
                     Some(Ok(()))
                 } else {
-                    w.tx.as_ref().map(|tx| tx.send(WalMsg::Snapshot(state)))
+                    w.snapshot_in_flight.store(true, std::sync::atomic::Ordering::Release);
+                    let n = SNAPSHOTS_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    SNAPSHOTS_IN_FLIGHT_MAX.fetch_max(n, std::sync::atomic::Ordering::SeqCst);
+                    let sent = w.tx.as_ref().map(|tx| tx.send(WalMsg::Snapshot(state)));
+                    if !matches!(sent, Some(Ok(()))) {
+                        SNAPSHOTS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        w.snapshot_in_flight.store(false, std::sync::atomic::Ordering::Release);
+                    }
+                    sent
                 };
                 match sent {
                     Some(Ok(())) => Ok(()),

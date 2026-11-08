@@ -127,6 +127,10 @@ pub static HOLD_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 #[doc(hidden)]
 pub static SYNC_BLOCKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Tests : délai (ms) ajouté à chaque écriture de snapshot, pour simuler un disque lent.
+#[doc(hidden)]
+pub static SNAPSHOT_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn hold_sync(shard_id: u16) {
     use std::sync::atomic::Ordering::SeqCst;
     let bit = 1u64 << shard_id;
@@ -209,6 +213,10 @@ impl Wal {
     /// Écrit un snapshot de l'état courant (tous les enregistrements déjà ajoutés y sont inclus),
     /// ouvre un nouveau segment puis supprime l'historique devenu inutile.
     pub fn snapshot(&mut self, state: &[u8]) -> io::Result<()> {
+        let delay = SNAPSHOT_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
         self.sync()?;
         let seq = self.last_seq();
         if seq == self.snapshot_seq {
