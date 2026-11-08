@@ -224,18 +224,22 @@ impl Wal {
         if seq == self.snapshot_seq {
             return Ok(());
         }
-        let mut data = Vec::with_capacity(state.len() + 40);
-        data.extend_from_slice(SNAPSHOT_MAGIC);
-        data.extend_from_slice(&self.shard_id.to_le_bytes());
-        data.extend_from_slice(&seq.to_le_bytes());
-        data.extend_from_slice(&(state.len() as u64).to_le_bytes());
-        data.extend_from_slice(state);
-        let crc = crc32fast::hash(&data);
-        data.extend_from_slice(&crc.to_le_bytes());
+        let mut head = Vec::with_capacity(32);
+        head.extend_from_slice(SNAPSHOT_MAGIC);
+        head.extend_from_slice(&self.shard_id.to_le_bytes());
+        head.extend_from_slice(&seq.to_le_bytes());
+        head.extend_from_slice(&(state.len() as u64).to_le_bytes());
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&head);
+        hasher.update(state);
+        let crc = hasher.finalize();
 
         let tmp = self.dir.join(format!("{}.tmp", snapshot_name(seq)));
         let mut f = File::create(&tmp)?;
-        f.write_all(&data)?;
+        // Même contenu octet pour octet que l'ancien buffer unique, sans copie de `state`.
+        f.write_all(&head)?;
+        f.write_all(state)?;
+        f.write_all(&crc.to_le_bytes())?;
         f.sync_all()?;
         fs::rename(&tmp, self.dir.join(snapshot_name(seq)))?;
         sync_dir(&self.dir)?;

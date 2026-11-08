@@ -49,6 +49,17 @@ impl Record {
         }
     }
 
+    /// Taille exacte sur disque : en-tête de 32 octets + payload + CRC32 de 4 octets.
+    pub fn wire_len(&self) -> u64 {
+        let payload = match self {
+            Self::Push { payload, .. } => 27 + payload.len(),
+            Self::Claim { .. } => 24,
+            Self::Retry { .. } => 16,
+            Self::Extend { .. } | Self::Ack { .. } | Self::Dead { .. } | Self::Cancel { .. } => 8,
+        };
+        (36 + payload) as u64
+    }
+
     pub fn encode_payload(&self) -> Vec<u8> {
         let mut w = Wr::default();
         match self {

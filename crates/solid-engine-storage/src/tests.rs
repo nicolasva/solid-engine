@@ -50,6 +50,26 @@ fn reservation(c: &ClaimedJob) -> Reservation {
 }
 
 #[test]
+fn record_wire_len_matches_bytes_written() {
+    let t = TempDir::new("wirelen");
+    let (mut shard, mut wal) = recover_shard(&t.0, 0, cfg()).unwrap();
+    shard.push(push(1), now_ms()).unwrap();
+    shard.push(push(2), now_ms()).unwrap();
+    let c = shard.claim(1, 60_000, now_ms()).unwrap().unwrap();
+    shard.ack(reservation(&c), now_ms()).unwrap();
+    let mut records = shard.take_log();
+    records.push(Record::Retry { job_id: 9, at: 1, scheduled_at: 2 });
+    records.push(Record::Extend { job_id: 9, lease_deadline: 3 });
+    records.push(Record::Dead { job_id: 9, at: 4 });
+    records.push(Record::Cancel { job_id: 9, at: 5 });
+    let before = fs::metadata(segment_path(&t.0)).unwrap().len();
+    wal.append(&records).unwrap();
+    wal.sync().unwrap();
+    let after = fs::metadata(segment_path(&t.0)).unwrap().len();
+    assert_eq!(after - before, records.iter().map(|r| r.wire_len()).sum::<u64>());
+}
+
+#[test]
 fn replay_restores_jobs_and_invalidates_old_reservations() {
     let t = TempDir::new("replay");
     let (mut shard, mut wal) = recover_shard(&t.0, 0, cfg()).unwrap();
@@ -238,4 +258,27 @@ fn data_dir_is_locked_and_pinned_to_shard_count() {
     drop(lock);
     assert!(matches!(lock_data_dir(&t.0, 8), Err(StorageError::Corrupt(_))));
     lock_data_dir(&t.0, 4).unwrap();
+}
+
+#[test]
+fn snapshot_file_layout_is_header_state_crc() {
+    let t = TempDir::new("snap-layout");
+    let (mut shard, mut wal) = recover_shard(&t.0, 3, cfg()).unwrap();
+    for id in 1..=4 {
+        shard.push(push(id), now_ms()).unwrap();
+    }
+    persist(&mut shard, &mut wal);
+    let state = shard.encode_snapshot();
+    wal.snapshot(&state).unwrap();
+    let (seq, path) = list(&t.0, "snap-", ".snap").unwrap().pop().unwrap();
+    let data = fs::read(path).unwrap();
+    let mut expect = Vec::new();
+    expect.extend_from_slice(SNAPSHOT_MAGIC);
+    expect.extend_from_slice(&3u16.to_le_bytes());
+    expect.extend_from_slice(&seq.to_le_bytes());
+    expect.extend_from_slice(&(state.len() as u64).to_le_bytes());
+    expect.extend_from_slice(&state);
+    let crc = crc32fast::hash(&expect);
+    expect.extend_from_slice(&crc.to_le_bytes());
+    assert_eq!(data, expect);
 }
