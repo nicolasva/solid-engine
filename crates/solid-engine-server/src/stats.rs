@@ -259,7 +259,7 @@ fn snap_stats() -> String {
     use crate::engine::*;
     use std::sync::atomic::Ordering::Relaxed;
     format!(
-        "snap_n={} snap_len_max={} snap_cap_max={} snap_live_cap={} snap_live_cap_max={} snap_copy_live={} snap_total_live_max={} snap_gate_deferred={} snap_backlog_max={} snap_encoding_max={} snap_inflight_max={} snap_def_by_shard={} snap_done_by_shard={}",
+        "snap_n={} snap_len_max={} snap_cap_max={} snap_live_cap={} snap_live_cap_max={} snap_copy_live={} snap_total_live_max={} snap_gate_deferred={} snap_backlog_max={} snap_encoding_max={} snap_inflight_max={} snap_def_by_shard={} snap_done_by_shard={} snap_backlog_now={}",
         SNAP_COUNT.load(Relaxed),
         SNAP_LEN_MAX.load(Relaxed),
         SNAP_CAP_MAX.load(Relaxed),
@@ -272,7 +272,8 @@ fn snap_stats() -> String {
         SNAP_ENCODING_MAX.load(Relaxed),
         SNAPSHOTS_IN_FLIGHT_MAX.load(Relaxed),
         SNAP_DEFERRED_BY_SHARD.iter().take(4).map(|a| a.load(Relaxed).to_string()).collect::<Vec<_>>().join("/"),
-        SNAP_DONE_BY_SHARD.iter().take(4).map(|a| a.load(Relaxed).to_string()).collect::<Vec<_>>().join("/")
+        SNAP_DONE_BY_SHARD.iter().take(4).map(|a| a.load(Relaxed).to_string()).collect::<Vec<_>>().join("/"),
+        SNAP_BACKLOG_NOW.iter().take(4).map(|a| a.load(Relaxed).to_string()).collect::<Vec<_>>().join("/")
     )
 }
 

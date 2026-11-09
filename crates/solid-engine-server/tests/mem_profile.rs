@@ -280,8 +280,97 @@ fn mem_profile() {
     }
     child.kill().unwrap();
     child.wait().unwrap();
+    if envn("MEM_RECOVER", 0) == 1 {
+        recover_report(&label, &dir, &cfg, &sock);
+    }
     if let Some(c) = consumer {
         let _ = c.join();
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn dur_ms(s: &str) -> f64 {
+    if let Some(v) = s.strip_suffix("ms") {
+        v.parse().unwrap_or(0.0)
+    } else if let Some(v) = s.strip_suffix("µs") {
+        v.parse::<f64>().unwrap_or(0.0) / 1000.0
+    } else if let Some(v) = s.strip_suffix('s') {
+        v.parse::<f64>().unwrap_or(0.0) * 1000.0
+    } else {
+        0.0
+    }
+}
+
+/// Après SIGKILL : volume WAL/snapshots conservé, records à rejouer, temps de récupération et de reprise du service.
+fn recover_report(label: &str, dir: &std::path::Path, cfg: &std::path::Path, sock: &std::path::Path) {
+    fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = vec![];
+    walk(&dir.join("data"), &mut files);
+    let (mut wal, mut snap) = (0u64, 0u64);
+    let mut snap_seq: HashMap<String, u64> = HashMap::new();
+    for p in &files {
+        let name = p.file_name().unwrap().to_string_lossy().to_string();
+        let len = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let shard = p.parent().unwrap().file_name().unwrap().to_string_lossy().trim_start_matches("shard-").to_string();
+        if name.starts_with("wal-") {
+            wal += len;
+        } else if name.starts_with("snap-") && name.ends_with(".snap") {
+            snap += len;
+            let seq: u64 = name["snap-".len()..name.len() - ".snap".len()].parse().unwrap_or(0);
+            let e = snap_seq.entry(shard).or_insert(0);
+            *e = (*e).max(seq);
+        }
+    }
+    let _ = std::fs::remove_file(sock);
+    let t0 = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_solid-engine-server"))
+        .arg("--config")
+        .arg(cfg)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let err = child.stderr.take().unwrap();
+    let info: Arc<Mutex<Vec<(String, f64, u64)>>> = Arc::new(Mutex::new(vec![]));
+    let i2 = info.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(err).lines().map_while(|l| l.ok()) {
+            if line.contains("recovered in") {
+                let w: Vec<&str> = line.split_whitespace().collect();
+                let shard = w[1].to_string();
+                let ms = dur_ms(w[4]);
+                let seq = w.last().unwrap().trim_end_matches(')').parse().unwrap_or(0);
+                i2.lock().unwrap().push((shard, ms, seq));
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(600);
+    while Client::connect_unix(sock).is_err() {
+        assert!(Instant::now() < deadline, "le serveur ne redémarre pas");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let ready_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    std::thread::sleep(Duration::from_millis(200));
+    let v = info.lock().unwrap().clone();
+    let rec_max = v.iter().map(|x| x.1).fold(0.0, f64::max);
+    let replayed: u64 = v.iter().map(|(s, _, last)| last.saturating_sub(*snap_seq.get(s).unwrap_or(&0))).sum();
+    println!(
+        "MEMREC {label} wal_mb={:.0} snap_mb={:.0} shards_recovered={} replayed_records={} recover_max_ms={:.0} ready_ms={:.0}",
+        wal as f64 / 1048576.0,
+        snap as f64 / 1048576.0,
+        v.len(),
+        replayed,
+        rec_max,
+        ready_ms
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
