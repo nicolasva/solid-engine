@@ -333,6 +333,10 @@ fn run(label: &str, durability: &str, every: u64, sf: bool, delay_ms: u64, run_m
     let mut daemon2 = Daemon::start(&dir, durability, every, false, 0, false);
     let ready_s = t1.elapsed().as_secs_f64();
     let mut c = daemon2.client();
+    let first_op_s = {
+        let Response::Stats(_) = c.call(&Request::GetQueueStats { channel_id: Some(1) }).unwrap() else { panic!() };
+        t1.elapsed().as_secs_f64()
+    };
     // lost = push acquitté absent après récupération, classé selon ce que le disque contenait.
     let (mut lost, mut lost_valid_rec, mut lost_snap_pat, mut max_tail) = (0usize, 0usize, 0usize, 0usize);
     for ids in &acked {
@@ -376,7 +380,7 @@ fn run(label: &str, durability: &str, every: u64, sf: bool, delay_ms: u64, run_m
          PUSH_PERDUS={lost} [record_valide_sur_disque={lost_valid_rec} motif_snapshot={lost_snap_pat}] queue_max={max_tail} ({:.0} ms) | \
          ACKS absents={ack_absent} autre_état={ack_other} [record_ack_valide_sur_disque={ack_valid_rec_not_done}] | \
          récupérés={recovered} inattendus={} | retard_writer mean={lag_mean} max={lag_max} records | records_envoyés_non_écrits_au_kill≈{unwritten} |{frontier} | \
-         wal_torn_bytes={} crc_invalides={} disque={:.0}Mo prêt={ready_s:.1}s | lat_batch_ms p50={:.1} p99={:.1} p99.9={:.1} | VmHWM={}Mo attente_backpressure={bp_ms}ms | octets_pend_max={} lot_max={} octets_écrits={} octets_par_record={:.1}",
+         wal_torn_bytes={} crc_invalides={} disque={:.0}Mo prêt={ready_s:.1}s première_op={first_op_s:.1}s | lat_batch_ms p50={:.1} p99={:.1} p99.9={:.1} | VmHWM={}Mo attente_backpressure={bp_ms}ms | octets_pend_max={} lot_max={} octets_écrits={} octets_par_record={:.1}",
         acked_ack.len(),
         max_tail as f64 / rate_real * 1000.0,
         recovered as i64 - (total - lost) as i64,

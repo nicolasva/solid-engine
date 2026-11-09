@@ -238,7 +238,7 @@ fn sigkill_during_continuous_snapshots_loses_no_confirmed_push() {
 #[test]
 fn sigkill_during_continuous_snapshots_balanced_single_flight_recovers_consistently() {
     use std::sync::{Arc, Mutex};
-    let dir = temp_dir("sigkill-snap-bal");
+    let dir = temp_dir("kill-bal");
     let confirmed: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
     let (mut next_id, mut sent_max) = (1u128, 0u128);
     let (mut lost_total, mut checked_total) = (0usize, 0usize);

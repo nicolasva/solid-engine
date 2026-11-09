@@ -1249,6 +1249,7 @@ pub static SNAP_BACKLOG_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 pub static SNAP_ENCODING_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static SNAP_ENCODING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static SNAP_DEFERRED_BY_SHARD: [std::sync::atomic::AtomicUsize; 16] = [const { std::sync::atomic::AtomicUsize::new(0) }; 16];
+pub static SNAP_BACKLOG_NOW: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 pub static SNAP_DONE_BY_SHARD: [std::sync::atomic::AtomicUsize; 16] = [const { std::sync::atomic::AtomicUsize::new(0) }; 16];
 
 fn snapshot_gate_acquire() -> bool {
@@ -1688,6 +1689,7 @@ pub(crate) fn flush(
         let busy = d.single_flight
             && d.writer.as_ref().is_some_and(|w| w.snapshot_in_flight.load(std::sync::atomic::Ordering::Acquire));
         let due_now = failed.is_none() && every > 0 && d.since_snapshot >= every && !busy;
+        SNAP_BACKLOG_NOW[(shard.id() as usize).min(15)].store(d.since_snapshot, std::sync::atomic::Ordering::Relaxed);
         if due_now {
             SNAP_BACKLOG_MAX.fetch_max(d.since_snapshot, std::sync::atomic::Ordering::Relaxed);
         }
