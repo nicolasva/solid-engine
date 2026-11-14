@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Version explicite ; à relever volontairement.
+  RUST_TOOLCHAIN: "1.97.1"
+
+jobs:
+  standard:
+    name: standard (features par défaut)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: standard
+      - name: cargo test --release --workspace
+        run: cargo test --release --workspace
+
+  fault-injection:
+    name: snapshot-fault-injection
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fault-injection
+      - name: snapshot_worker_faults (4 tests)
+        run: >
+          cargo test --release -p solid-engine-server
+          --features snapshot-fault-injection
+          --test snapshot_worker_faults
+      - name: tests de snapshot et de durabilité avec la feature
+        run: >
+          cargo test --release -p solid-engine-server
+          --features snapshot-fault-injection
+          --test snapshot_faults --test snapshot_gate
+          --test snapshot_single_flight --test durability
+      - name: stockage avec la feature
+        run: >
+          cargo test --release -p solid-engine-storage
+          --features snapshot-fault-injection
+
+  diagnostics:
+    name: wal-diagnostics
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: diagnostics
+      - name: stockage
+        run: cargo test --release -p solid-engine-storage --features wal-diagnostics
+      - name: serveur
+        run: cargo test --release -p solid-engine-server --features wal-diagnostics
+
+  combined:
+    name: features combinées
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: combined
+      - name: stockage
+        run: >
+          cargo test --release -p solid-engine-storage
+          --features snapshot-fault-injection,wal-diagnostics
+      - name: serveur (inclut snapshot_worker_faults)
+        run: >
+          cargo test --release -p solid-engine-server
+          --features snapshot-fault-injection,wal-diagnostics
+      - name: kill_audit_load compile (banc ignoré, non exécuté)
+        run: >
+          cargo test --release -p solid-engine-server
+          --features snapshot-fault-injection,wal-diagnostics
+          --test kill_audit_load --no-run
+
+  clippy:
+    name: clippy (standard et features combinées)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+      # Les avertissements historiques ne bloquent pas ; seules les erreurs échouent.
+      - name: clippy standard
+        run: cargo clippy --workspace --all-targets
+      - name: clippy features combinées
+        run: >
+          cargo clippy -p solid-engine-storage -p solid-engine-server
+          --all-targets --features snapshot-fault-injection,wal-diagnostics
