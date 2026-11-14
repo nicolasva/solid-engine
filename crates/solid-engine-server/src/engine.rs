@@ -1302,6 +1302,14 @@ pub static LAG_WRITTEN: [std::sync::atomic::AtomicU64; 16] = [const { std::sync:
 pub static LAG_SYNCED: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 pub static BYTES_SENT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 pub static BYTES_WRITTEN: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+/// Plafond par défaut, par shard, des octets WAL envoyés au writer et pas encore écrits (0 = illimité).
+pub const DEFAULT_MAX_PENDING_WAL_BYTES: u64 = 67_108_864;
+
+/// Octets WAL envoyés au writer du shard et pas encore écrits (ne décroît pas si l'écriture échoue).
+pub fn pending_wal_bytes(shard: usize) -> u64 {
+    let l = std::sync::atomic::Ordering::Relaxed;
+    BYTES_SENT[shard].load(l).saturating_sub(BYTES_WRITTEN[shard].load(l))
+}
 /// Maximum observé de (octets envoyés non écrits + fournée en cours d'envoi) et taille maximale d'une fournée.
 pub static BYTES_PEND_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BYTES_BATCH_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1407,6 +1415,8 @@ fn start_lag_printer(shards: usize) {
                     let l = std::sync::atomic::Ordering::Relaxed;
                     line += &format!(" {i}:{},{},{},{}", LAG_SENT[i].load(l), LAG_WRITTEN[i].load(l), LAG_SYNCED[i].load(l), LAG_SNAP[i].load(l));
                 }
+                line += " pwb=";
+                line += &(0..shards.min(16)).map(|i| pending_wal_bytes(i).to_string()).collect::<Vec<_>>().join(",");
                 eprintln!("{line}");
                 #[cfg(feature = "wal-diagnostics")]
                 print_diag_counters(shards, t0);
@@ -1821,8 +1831,13 @@ impl WalWriter {
     fn wait_for_capacity(&self) {
         static MAX: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
         let (max_rec, max_bytes) = *MAX.get_or_init(|| {
-            let get = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-            (get("SOLID_ENGINE_WAL_MAX_PENDING_RECORDS"), get("SOLID_ENGINE_WAL_MAX_PENDING_BYTES"))
+            let get = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
+            (
+                get("SOLID_ENGINE_WAL_MAX_PENDING_RECORDS").unwrap_or(0),
+                get("SOLID_MAX_PENDING_WAL_BYTES")
+                    .or_else(|| get("SOLID_ENGINE_WAL_MAX_PENDING_BYTES"))
+                    .unwrap_or(DEFAULT_MAX_PENDING_WAL_BYTES),
+            )
         });
         if max_rec == 0 && max_bytes == 0 {
             return;
@@ -2186,6 +2201,29 @@ fn apply_cmd(
     false
 }
 
+/// Épingle le thread du shard sur un cœur si SOLID_PIN_THREADS=1 (désactivé par défaut : les conteneurs
+/// restreignent souvent l'affinité). Un refus du système n'est qu'un avertissement.
+fn pin_shard_thread(id: usize) {
+    static CORES: std::sync::OnceLock<Option<Vec<core_affinity::CoreId>>> = std::sync::OnceLock::new();
+    let cores = CORES.get_or_init(|| {
+        if std::env::var("SOLID_PIN_THREADS").as_deref() != Ok("1") {
+            return None;
+        }
+        let ids = core_affinity::get_core_ids().filter(|v| !v.is_empty());
+        if ids.is_none() {
+            eprintln!("warning: SOLID_PIN_THREADS=1 mais aucun cœur disponible : pas d'épinglage");
+        }
+        ids
+    });
+    let Some(cores) = cores else { return };
+    let core = cores[id % cores.len()];
+    if core_affinity::set_for_current(core) {
+        eprintln!("pin shard {id} -> core {}", core.id);
+    } else {
+        eprintln!("warning: affinité refusée pour shard {id} -> core {}", core.id);
+    }
+}
+
 fn shard_thread(
     id: usize,
     cfg: Arc<Config>,
@@ -2193,6 +2231,7 @@ fn shard_thread(
     notifier: Arc<Notifier>,
     ready: std::sync::mpsc::Sender<std::result::Result<(), String>>,
 ) {
+    pin_shard_thread(id);
     let mut gate = SpinGate::default();
     let (mut shard, mut durable) = match open_shard(id, &cfg) {
         Ok(v) => {
