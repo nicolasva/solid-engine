@@ -151,6 +151,66 @@ fn injected() -> io::Result<()> {
     Ok(())
 }
 
+/// Tests (camp35-E, chemin `snapshot_begin`/`publish`/`snapshot_finish`) : frontière (1..=6) où une erreur d'I/O est injectée.
+#[doc(hidden)]
+pub static SNAPSHOT_FAIL_AT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Frontières de publication d'un snapshot : 1 avant création du .tmp, 2 après écriture, 3 après sync_all,
+/// 4 après rename, 5 avant rotation du segment, 6 après rotation et avant nettoyage.
+/// `SOLID_ENGINE_TEST_SNAPSHOT_CRASH_AT=n` arrête brutalement le processus (équivalent d'un SIGKILL) à la frontière n.
+fn boundary(n: u8) -> io::Result<()> {
+    static CRASH: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let crash = *CRASH.get_or_init(|| std::env::var("SOLID_ENGINE_TEST_SNAPSHOT_CRASH_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    if crash == n {
+        std::process::abort();
+    }
+    if SNAPSHOT_FAIL_AT.load(std::sync::atomic::Ordering::SeqCst) == n {
+        return Err(io::Error::other(format!("injected snapshot failure at boundary {n}")));
+    }
+    Ok(())
+}
+
+/// Publication d'un snapshot hors du thread du writer (camp35-E). Le writer garde la frontière WAL (`seq`),
+/// la rotation et la suppression des segments ; le worker ne touche qu'au fichier de snapshot.
+pub struct SnapshotJob {
+    dir: PathBuf,
+    shard_id: u16,
+    pub seq: u64,
+}
+
+impl SnapshotJob {
+    /// Écrit `snap-{seq}.snap` de façon atomique (tmp, sync_all, rename, sync du répertoire).
+    pub fn publish(&self, state: &[u8]) -> io::Result<()> {
+        static ENV_DELAY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let env = *ENV_DELAY.get_or_init(|| std::env::var("SOLID_ENGINE_TEST_SNAPSHOT_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        let delay = SNAPSHOT_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed).max(env);
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
+        boundary(1)?;
+        let mut head = Vec::with_capacity(32);
+        head.extend_from_slice(SNAPSHOT_MAGIC);
+        head.extend_from_slice(&self.shard_id.to_le_bytes());
+        head.extend_from_slice(&self.seq.to_le_bytes());
+        head.extend_from_slice(&(state.len() as u64).to_le_bytes());
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&head);
+        hasher.update(state);
+        let crc = hasher.finalize();
+        let tmp = self.dir.join(format!("{}.tmp", snapshot_name(self.seq)));
+        let mut f = File::create(&tmp)?;
+        f.write_all(&head)?;
+        f.write_all(state)?;
+        f.write_all(&crc.to_le_bytes())?;
+        boundary(2)?;
+        f.sync_all()?;
+        boundary(3)?;
+        fs::rename(&tmp, self.dir.join(snapshot_name(self.seq)))?;
+        boundary(4)?;
+        sync_dir(&self.dir)
+    }
+}
+
 pub struct Wal {
     dir: PathBuf,
     shard_id: u16,
@@ -227,6 +287,48 @@ impl Wal {
             self.file.sync_data()?;
             self.unsynced = false;
         }
+        Ok(())
+    }
+
+    /// Début d'un snapshot publié par un worker : synchronise le WAL jusqu'à la frontière puis la fixe.
+    /// `None` si l'état courant est déjà couvert par le dernier snapshot. Un seul snapshot à la fois par WAL.
+    /// `upto` est le dernier seq écrit au moment où l'état du snapshot a été reçu par le writer : un état
+    /// encodé plus tôt ne couvre jamais les records ajoutés depuis (cas d'un snapshot mis en attente).
+    pub fn snapshot_begin(&mut self, upto: u64) -> io::Result<Option<SnapshotJob>> {
+        self.sync()?;
+        let seq = upto.min(self.last_seq());
+        if seq <= self.snapshot_seq {
+            return Ok(None);
+        }
+        Ok(Some(SnapshotJob { dir: self.dir.clone(), shard_id: self.shard_id, seq }))
+    }
+
+    /// Fin d'un snapshot dont `publish` a réussi : rotation du segment actif puis suppression des segments
+    /// entièrement couverts. Les records écrits après la frontière restent dans leur segment tant que
+    /// le snapshot suivant ne les couvre pas.
+    pub fn snapshot_finish(&mut self, seq: u64) -> io::Result<()> {
+        boundary(5)?;
+        let new_first = self.next_seq;
+        if new_first != self.segment_first_seq {
+            // Les records écrits après la frontière sont synchronisés avant d'abandonner le segment.
+            self.sync()?;
+            self.file = create_segment(&self.dir, new_first)?;
+            self.segment_first_seq = new_first;
+        }
+        boundary(6)?;
+        let segments = list(&self.dir, "wal-", ".log")?;
+        for pair in segments.windows(2) {
+            if pair[1].0 <= seq + 1 {
+                fs::remove_file(&pair[0].1)?;
+            }
+        }
+        for (s, path) in list(&self.dir, "snap-", ".snap")? {
+            if s < seq {
+                fs::remove_file(path)?;
+            }
+        }
+        self.snapshot_seq = seq;
+        self.since_snapshot = self.last_seq().saturating_sub(seq);
         Ok(())
     }
 

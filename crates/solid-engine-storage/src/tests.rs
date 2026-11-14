@@ -282,3 +282,27 @@ fn snapshot_file_layout_is_header_state_crc() {
     expect.extend_from_slice(&crc.to_le_bytes());
     assert_eq!(data, expect);
 }
+
+#[test]
+fn deferred_snapshot_does_not_cover_records_appended_after_its_state() {
+    let t = TempDir::new("snapdeferred");
+    let (mut shard, mut wal) = recover_shard(&t.0, 0, cfg()).unwrap();
+    for id in 1..=5 {
+        shard.push(push(id), now_ms()).unwrap();
+    }
+    persist(&mut shard, &mut wal);
+    let (state, upto) = (shard.encode_snapshot(), wal.last_seq());
+    // Records écrits entre l'encodage de l'état et le démarrage de la publication.
+    for id in 6..=8 {
+        shard.push(push(id), now_ms()).unwrap();
+    }
+    persist(&mut shard, &mut wal);
+    let job = wal.snapshot_begin(upto).unwrap().unwrap();
+    assert_eq!(job.seq, upto);
+    job.publish(&state).unwrap();
+    wal.snapshot_finish(upto).unwrap();
+    drop((shard, wal));
+
+    let (mut shard, _wal) = recover_shard(&t.0, 0, cfg()).unwrap();
+    assert_eq!(shard.stats(Some(1), now_ms()).ready, 8);
+}

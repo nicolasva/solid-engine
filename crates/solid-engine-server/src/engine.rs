@@ -1220,6 +1220,34 @@ enum WalMsg {
     /// État encodé par le shard après l'envoi de tous les enregistrements qui le précèdent : la file étant
     /// FIFO, le writer le rattache à la séquence exacte de l'état sans que le shard attende l'I/O.
     Snapshot(Vec<u8>),
+    /// camp35-E : fin de publication d'un snapshot par le worker (résultat, état rendu au writer).
+    SnapDone(std::io::Result<()>, Vec<u8>),
+}
+
+/// camp35-E EXPERIMENTAL (SOLID_ENGINE_SNAPSHOT_WORKER=1, désactivé par défaut) : la publication du snapshot
+/// (fichier tmp, sync_all, rename, sync du répertoire) est exécutée par un worker par shard ; le writer garde la
+/// frontière WAL, la rotation et le nettoyage des segments, et continue à écrire les Append entre-temps.
+fn snapshot_worker_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("SOLID_ENGINE_SNAPSHOT_WORKER").is_ok_and(|v| v == "1"))
+}
+
+struct SnapWork {
+    job: solid_engine_storage::SnapshotJob,
+    state: Vec<u8>,
+    done: std::sync::mpsc::SyncSender<WalMsg>,
+}
+
+/// Libère les compteurs d'un snapshot terminé, abandonné ou en échec (mêmes effets que le chemin synchrone).
+fn snapshot_release(shard_id: usize, state: Vec<u8>, flag: Option<&std::sync::atomic::AtomicBool>) {
+    SNAP_LIVE_CAP.fetch_sub(state.capacity(), std::sync::atomic::Ordering::Relaxed);
+    drop(state);
+    SNAPSHOTS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    SNAP_DONE_BY_SHARD[shard_id.min(15)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    snapshot_gate_release();
+    if let Some(f) = flag {
+        f.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Tests : snapshots envoyés au writer et non terminés (tous shards), et maximum observé.
@@ -1401,6 +1429,14 @@ struct WalWriter {
     /// Un seul snapshot par shard est en vol : sans cela, des snapshots complets s'empilent
     /// dans la file quand le disque est plus lent que la production, et la mémoire n'est pas bornée.
     snapshot_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// Émetteur remis aux jobs de snapshot ; vidé à l'arrêt pour que la file puisse se déconnecter.
+    done_slot: Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<WalMsg>>>>,
+}
+
+impl Drop for WalWriter {
+    fn drop(&mut self) {
+        self.done_slot.lock().unwrap().take();
+    }
 }
 
 impl WalWriter {
@@ -1411,6 +1447,8 @@ impl WalWriter {
         let slot = error.clone();
         let in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer_flag = in_flight.clone();
+        let done_slot = Arc::new(std::sync::Mutex::new(snapshot_worker_enabled().then(|| tx.clone())));
+        let done_slot_thread = done_slot.clone();
         {
             let l = std::sync::atomic::Ordering::Relaxed;
             LAG_SENT[shard_id].store(wal.last_seq(), l);
@@ -1426,6 +1464,63 @@ impl WalWriter {
                 };
                 let mut due: Option<Instant> = None;
                 let mut carry: Option<WalMsg> = None;
+                let worker = snapshot_worker_enabled();
+                let mut work_tx: Option<std::sync::mpsc::SyncSender<SnapWork>> = None;
+                // Snapshot en cours de publication, et le plus récent en attente (les plus anciens sont abandonnés).
+                let mut inflight = false;
+                let mut snap_seq_inflight = 0u64;
+                let mut pending_snap: Option<(Vec<u8>, u64)> = None;
+                macro_rules! start_snapshot {
+                    ($state:expr, $upto:expr) => {{
+                        let state: Vec<u8> = $state;
+                        let upto: u64 = $upto;
+                        let td = diag_on().then(Instant::now);
+                        match wal.snapshot_begin(upto) {
+                            Ok(None) => snapshot_release(shard_id, state, Some(&writer_flag)),
+                            Ok(Some(job)) => {
+                                snap_cnt(2);
+                                due = None;
+                                let done = done_slot_thread.lock().unwrap().clone();
+                                match done {
+                                    Some(done) => {
+                                        let wtx = work_tx.get_or_insert_with(|| {
+                                            let (wtx, wrx) = std::sync::mpsc::sync_channel::<SnapWork>(1);
+                                            let _ = std::thread::Builder::new()
+                                                .name(format!("solid-engine-snap-{shard_id}"))
+                                                .spawn(move || {
+                                                    for w in wrx {
+                                                        let t = Instant::now();
+                                                        let r = w.job.publish(&w.state);
+                                                        if diag_on() {
+                                                            diag_event(shard_id, 3, t);
+                                                        }
+                                                        let _ = w.done.send(WalMsg::SnapDone(r, w.state));
+                                                    }
+                                                });
+                                            wtx
+                                        });
+                                        snap_seq_inflight = job.seq;
+                                        match wtx.send(SnapWork { job, state, done }) {
+                                            Ok(()) => inflight = true,
+                                            Err(e) => {
+                                                fail("WAL snapshot failed", std::io::Error::other("snapshot worker stopped"));
+                                                snapshot_release(shard_id, e.0.state, Some(&writer_flag));
+                                            }
+                                        }
+                                    }
+                                    None => snapshot_release(shard_id, state, Some(&writer_flag)),
+                                }
+                            }
+                            Err(e) => {
+                                fail("WAL snapshot failed", e);
+                                snapshot_release(shard_id, state, Some(&writer_flag));
+                            }
+                        }
+                        if let Some(td) = td {
+                            diag_event(shard_id, 2, td);
+                        }
+                    }};
+                }
                 let mut tally =
                     crate::stats::Tally::default().with_cpu_role(crate::stats::C::CpuWalNs);
                 loop {
@@ -1538,6 +1633,52 @@ impl WalWriter {
                                 p(failure.as_ref());
                             }
                         }
+                        Ok(WalMsg::Snapshot(state)) if worker => {
+                            snap_cnt(0);
+                            let upto = wal.last_seq();
+                            if slot.lock().unwrap().is_some() {
+                                snapshot_release(shard_id, state, Some(&writer_flag));
+                            } else if inflight {
+                                if let Some((old, _)) = pending_snap.replace((state, upto)) {
+                                    snap_cnt(1);
+                                    snapshot_release(shard_id, old, None);
+                                }
+                            } else {
+                                start_snapshot!(state, upto);
+                            }
+                        }
+                        Ok(WalMsg::SnapDone(result, state)) => {
+                            inflight = false;
+                            let td = diag_on().then(Instant::now);
+                            match result {
+                                Ok(()) if slot.lock().unwrap().is_none() => match wal.snapshot_finish(snap_seq_inflight) {
+                                    Ok(()) => {
+                                        snap_cnt(3);
+                                        LAG_SNAP[shard_id].store(snap_seq_inflight, std::sync::atomic::Ordering::Relaxed)
+                                    }
+                                    Err(e) => {
+                                        snap_cnt(4);
+                                        fail("WAL snapshot failed", e)
+                                    }
+                                },
+                                Ok(()) => {}
+                                Err(e) => {
+                                    snap_cnt(4);
+                                    fail("WAL snapshot failed", e)
+                                }
+                            }
+                            if let Some(td) = td {
+                                diag_event(shard_id, 2, td);
+                            }
+                            snapshot_release(shard_id, state, Some(&writer_flag));
+                            if let Some((next, next_upto)) = pending_snap.take() {
+                                if slot.lock().unwrap().is_none() {
+                                    start_snapshot!(next, next_upto);
+                                } else {
+                                    snapshot_release(shard_id, next, Some(&writer_flag));
+                                }
+                            }
+                        }
                         Ok(WalMsg::Snapshot(state)) => {
                             snap_cnt(0);
                             if slot.lock().unwrap().is_none() {
@@ -1601,6 +1742,9 @@ impl WalWriter {
                             }
                         }
                         Err(RecvTimeoutError::Disconnected) => {
+                            if let Some((p, _)) = pending_snap.take() {
+                                snapshot_release(shard_id, p, Some(&writer_flag));
+                            }
                             if let Err(e) = wal.sync() {
                                 fail("WAL sync failed", e);
                             }
@@ -1616,6 +1760,7 @@ impl WalWriter {
             handle: Some(handle),
             snapshot_in_flight: in_flight,
             shard_id,
+            done_slot,
         }
     }
 
@@ -1661,6 +1806,7 @@ impl WalWriter {
     /// Arrêt propre : ferme la file, le thread synchronise puis se termine.
     fn finish(mut self) {
         self.tx = None;
+        self.done_slot.lock().unwrap().take();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
