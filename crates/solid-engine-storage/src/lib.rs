@@ -162,6 +162,19 @@ pub struct Wal {
     unsynced: bool,
 }
 
+/// Diagnostic (camp35, `SOLID_ENGINE_WAL_LAG`) : temps d'encodage et de `write_all` par shard, cumulés en ns.
+pub static DIAG_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static DIAG_ENCODE_NS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+pub static DIAG_WRITE_NS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+
+pub fn diag_epoch() -> std::time::Instant {
+    static T: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *T.get_or_init(std::time::Instant::now)
+}
+/// Phases d'un snapshot (µs) : sync WAL préalable, création+écriture, sync_all, rename, sync répertoire,
+/// nouveau segment, nettoyage. (shard, début µs, phases)
+pub static DIAG_SNAP: std::sync::Mutex<Vec<(u8, u64, [u64; 7])>> = std::sync::Mutex::new(Vec::new());
+
 impl Wal {
     pub fn last_seq(&self) -> u64 {
         self.next_seq - 1
@@ -178,6 +191,7 @@ impl Wal {
     /// Ajoute un lot d'enregistrements en une seule écriture (group commit).
     pub fn append(&mut self, records: &[Record]) -> io::Result<()> {
         injected()?;
+        let diag = DIAG_ON.load(std::sync::atomic::Ordering::Relaxed).then(std::time::Instant::now);
         let mut buf = Vec::new();
         for rec in records {
             let payload = rec.encode_payload();
@@ -193,8 +207,14 @@ impl Wal {
             buf.extend_from_slice(&crc.to_le_bytes());
             self.next_seq += 1;
         }
+        let written = diag.map(|_| std::time::Instant::now());
         // En cas d'échec d'I/O, le WAL est considéré comme défaillant et n'est plus utilisé.
         self.file.write_all(&buf)?;
+        if let (Some(t0), Some(t1)) = (diag, written) {
+            let sh = (self.shard_id as usize).min(15);
+            DIAG_ENCODE_NS[sh].fetch_add(t1.duration_since(t0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            DIAG_WRITE_NS[sh].fetch_add(t1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         self.since_snapshot += records.len() as u64;
         self.unsynced = true;
         Ok(())
@@ -219,7 +239,15 @@ impl Wal {
         if delay > 0 {
             std::thread::sleep(std::time::Duration::from_millis(delay));
         }
+        let diag = DIAG_ON.load(std::sync::atomic::Ordering::Relaxed).then(std::time::Instant::now);
+        let mut ph = [0u64; 7];
+        let mut mark = std::time::Instant::now();
+        let mut lap = |i: usize, ph: &mut [u64; 7]| {
+            ph[i] = mark.elapsed().as_micros() as u64;
+            mark = std::time::Instant::now();
+        };
         self.sync()?;
+        lap(0, &mut ph);
         let seq = self.last_seq();
         if seq == self.snapshot_seq {
             return Ok(());
@@ -240,15 +268,20 @@ impl Wal {
         f.write_all(&head)?;
         f.write_all(state)?;
         f.write_all(&crc.to_le_bytes())?;
+        lap(1, &mut ph);
         f.sync_all()?;
+        lap(2, &mut ph);
         fs::rename(&tmp, self.dir.join(snapshot_name(seq)))?;
+        lap(3, &mut ph);
         sync_dir(&self.dir)?;
+        lap(4, &mut ph);
 
         let new_first = seq + 1;
         if new_first != self.segment_first_seq {
             self.file = create_segment(&self.dir, new_first)?;
             self.segment_first_seq = new_first;
         }
+        lap(5, &mut ph);
         for (first, path) in list(&self.dir, "wal-", ".log")? {
             if first < new_first {
                 fs::remove_file(path)?;
@@ -258,6 +291,10 @@ impl Wal {
             if s < seq {
                 fs::remove_file(path)?;
             }
+        }
+        lap(6, &mut ph);
+        if let Some(t) = diag {
+            DIAG_SNAP.lock().unwrap().push((self.shard_id as u8, t.duration_since(diag_epoch()).as_micros() as u64, ph));
         }
         self.snapshot_seq = seq;
         self.since_snapshot = 0;

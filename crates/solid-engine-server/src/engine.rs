@@ -1278,7 +1278,42 @@ pub static BYTES_WRITTEN: [std::sync::atomic::AtomicU64; 16] = [const { std::syn
 pub static BYTES_PEND_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BYTES_BATCH_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BP_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// camp35-E1 : compteurs de snapshots [demandés, fusionnés, démarrés, réussis, échoués], tous shards.
+pub static SNAP_CNT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+fn snap_cnt(i: usize) {
+    SNAP_CNT[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 pub static LAG_SNAP: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+
+/// Diagnostic du writer (camp35), cumulé par shard et lu à 10 Hz si SOLID_ENGINE_WAL_LAG est défini :
+/// [appends, records, batch_max, sync_n, sync_ns, sync_max_ns, idle_ns, wakes, append_ns, sync_timer_n].
+const DIAG_FIELDS: usize = 10;
+pub static DIAG: [[std::sync::atomic::AtomicU64; DIAG_FIELDS]; 16] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; DIAG_FIELDS] }; 16];
+
+/// camp35-D : journal d'événements du writer (shard, genre 0=append 1=sync 2=snapshot, début µs, durée µs).
+/// Les appends < 100 µs ne sont pas journalisés (ils sont comptés dans l'histogramme `DIAG_H`).
+static DIAG_EV: std::sync::Mutex<Vec<(u8, u8, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+static DIAG_H: [[std::sync::atomic::AtomicU64; 24]; 4] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 24] }; 4];
+fn diag_epoch() -> Instant {
+    solid_engine_storage::diag_epoch()
+}
+fn diag_event(shard: usize, kind: usize, start: Instant) {
+    let dur = start.elapsed().as_micros() as u64;
+    let b = (64 - dur.max(1).leading_zeros() as usize - 1).min(23);
+    DIAG_H[kind][b].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if kind != 0 || dur >= 100 {
+        let st = start.duration_since(diag_epoch()).as_micros() as u64;
+        DIAG_EV.lock().unwrap().push((shard as u8, kind as u8, st, dur));
+    }
+}
+
+fn diag_on() -> bool {
+    solid_engine_storage::DIAG_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn diag_add(shard: usize, field: usize, v: u64) {
+    DIAG[shard][field].fetch_add(v, std::sync::atomic::Ordering::Relaxed);
+}
 
 fn start_lag_printer(shards: usize) {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1286,24 +1321,72 @@ fn start_lag_printer(shards: usize) {
         if std::env::var("SOLID_ENGINE_WAL_LAG").is_err() {
             return;
         }
+        solid_engine_storage::DIAG_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+        diag_epoch();
+        // Retard échantillonné à 1 kHz : "wal_pend t_us shard:unwritten,unsynced ..." (écrit 10 fois par seconde).
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let mut last = Instant::now();
+            loop {
+                std::thread::sleep(Duration::from_millis(1));
+                let l = std::sync::atomic::Ordering::Relaxed;
+                buf += &format!("wal_pend {}", diag_epoch().elapsed().as_micros());
+                for i in 0..shards.min(2) {
+                    let (sent, w, sy) = (LAG_SENT[i].load(l), LAG_WRITTEN[i].load(l), LAG_SYNCED[i].load(l));
+                    buf += &format!(" {},{}", sent.saturating_sub(w), w.saturating_sub(sy));
+                }
+                buf.push('\n');
+                if last.elapsed() >= Duration::from_millis(100) {
+                    last = Instant::now();
+                    let ev: Vec<_> = std::mem::take(&mut *DIAG_EV.lock().unwrap());
+                    for (sh, k, st, d) in ev {
+                        buf += &format!("wal_ev {sh} {k} {st} {d}\n");
+                    }
+                    let sn: Vec<_> = std::mem::take(&mut *solid_engine_storage::DIAG_SNAP.lock().unwrap());
+                    for (sh, st, p) in sn {
+                        buf += &format!("wal_snap {sh} {st} {}\n", p.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" "));
+                    }
+                    let h: Vec<String> = (0..4).map(|k| DIAG_H[k].iter().map(|x| x.load(l).to_string()).collect::<Vec<_>>().join(",")).collect();
+                    buf += &format!("wal_hist {}\n", h.join(" "));
+                    eprint!("{buf}");
+                    buf.clear();
+                }
+            }
+        });
         std::thread::spawn(move || {
             let t0 = Instant::now();
             loop {
                 std::thread::sleep(Duration::from_millis(100));
                 let l = std::sync::atomic::Ordering::Relaxed;
                 let mut line = format!(
-                    "wal_lag t={} bp={} pbmax={} bbmax={} bw={}",
+                    "wal_lag t={} bp={} pbmax={} bbmax={} bw={} snapc={}",
                     t0.elapsed().as_millis(),
                     BP_WAIT_US.load(l),
                     BYTES_PEND_MAX.load(l),
                     BYTES_BATCH_MAX.load(l),
-                    (0..shards.min(16)).map(|i| BYTES_WRITTEN[i].load(l)).sum::<u64>()
+                    (0..shards.min(16)).map(|i| BYTES_WRITTEN[i].load(l)).sum::<u64>(),
+                    SNAP_CNT.iter().map(|c| c.load(l).to_string()).collect::<Vec<_>>().join(",")
                 );
                 for i in 0..shards.min(16) {
                     let l = std::sync::atomic::Ordering::Relaxed;
                     line += &format!(" {i}:{},{},{},{}", LAG_SENT[i].load(l), LAG_WRITTEN[i].load(l), LAG_SYNCED[i].load(l), LAG_SNAP[i].load(l));
                 }
                 eprintln!("{line}");
+                let l = std::sync::atomic::Ordering::Relaxed;
+                let mut d = format!("wal_diag t={}", t0.elapsed().as_millis());
+                for i in 0..shards.min(16) {
+                    let v: Vec<u64> = DIAG[i].iter().map(|x| x.load(l)).collect();
+                    if v.iter().all(|x| *x == 0) {
+                        continue;
+                    }
+                    d += &format!(
+                        " {i}:{},{},{},{},{},{},{},{},{},{},{},{}",
+                        v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9],
+                        solid_engine_storage::DIAG_ENCODE_NS[i].load(l),
+                        solid_engine_storage::DIAG_WRITE_NS[i].load(l)
+                    );
+                }
+                eprintln!("{d}");
             }
         });
     });
@@ -1347,6 +1430,7 @@ impl WalWriter {
                     crate::stats::Tally::default().with_cpu_role(crate::stats::C::CpuWalNs);
                 loop {
                     let carry_none = carry.is_none();
+                    let idle_from = (carry_none && diag_on()).then(Instant::now);
                     let msg = match carry.take() {
                         Some(m) => Ok(m),
                         None => match due {
@@ -1354,6 +1438,13 @@ impl WalWriter {
                             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
                         },
                     };
+                    if let Some(t) = idle_from {
+                        let ns = t.elapsed().as_nanos() as u64;
+                        diag_add(shard_id, 6, ns);
+                        if ns > 50_000 {
+                            diag_add(shard_id, 7, 1);
+                        }
+                    }
                     if let (true, Ok(m)) = (carry_none && wal_trace::on(), &msg) {
                         wal_trace::received(match m {
                             WalMsg::Append(r) | WalMsg::Commit(r, _) => r.len(),
@@ -1368,7 +1459,15 @@ impl WalWriter {
                         Ok(WalMsg::Append(records)) => {
                             if slot.lock().unwrap().is_none() {
                                 let t0 = wal_trace::on().then(Instant::now);
+                                let td = diag_on().then(Instant::now);
                                 let r = wal.append(&records);
+                                if let Some(td) = td {
+                                    diag_add(shard_id, 0, 1);
+                                    diag_add(shard_id, 1, records.len() as u64);
+                                    DIAG[shard_id][2].fetch_max(records.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                                    diag_add(shard_id, 8, td.elapsed().as_nanos() as u64);
+                                    diag_event(shard_id, 0, td);
+                                }
                                 if let Some(t0) = t0 {
                                     wal_trace::appended(t0.elapsed());
                                 }
@@ -1413,10 +1512,18 @@ impl WalWriter {
                             }
                             if slot.lock().unwrap().is_none() {
                                 let t0 = wal_trace::on().then(Instant::now);
+                                let td = diag_on().then(Instant::now);
                                 if let Err(e) = wal.sync() {
                                     fail("WAL sync failed", e);
                                 } else {
                                     LAG_SYNCED[shard_id].store(wal.last_seq(), std::sync::atomic::Ordering::Relaxed);
+                                }
+                                if let Some(td) = td {
+                                    let ns = td.elapsed().as_nanos() as u64;
+                                    diag_add(shard_id, 3, 1);
+                                    diag_add(shard_id, 4, ns);
+                                    DIAG[shard_id][5].fetch_max(ns, std::sync::atomic::Ordering::Relaxed);
+                                    diag_event(shard_id, 1, td);
                                 }
                                 if let Some(t0) = t0 {
                                     wal_trace::synced(t0.elapsed(), batch.len());
@@ -1432,8 +1539,11 @@ impl WalWriter {
                             }
                         }
                         Ok(WalMsg::Snapshot(state)) => {
+                            snap_cnt(0);
                             if slot.lock().unwrap().is_none() {
+                                snap_cnt(2);
                                 let t0 = wal_trace::on().then(Instant::now);
+                                let td = diag_on().then(Instant::now);
                                 // `Wal::snapshot` n'effectue plus de copie complète de l'état.
                                 let copy = 0usize;
                                 {
@@ -1445,10 +1555,17 @@ impl WalWriter {
                                 SNAP_COPY_LIVE.fetch_sub(copy, std::sync::atomic::Ordering::Relaxed);
                                 match snap_result {
                                     Ok(()) => {
+                                        snap_cnt(3);
                                         due = None;
                                         LAG_SNAP[shard_id].store(wal.last_seq(), std::sync::atomic::Ordering::Relaxed);
                                     }
-                                    Err(e) => fail("WAL snapshot failed", e),
+                                    Err(e) => {
+                                        snap_cnt(4);
+                                        fail("WAL snapshot failed", e)
+                                    }
+                                }
+                                if let Some(td) = td {
+                                    diag_event(shard_id, 2, td);
                                 }
                                 if let Some(t0) = t0 {
                                     wal_trace::snapshot_io(t0.elapsed());
@@ -1465,10 +1582,19 @@ impl WalWriter {
                         Err(RecvTimeoutError::Timeout) => {
                             due = None;
                             let t0 = wal_trace::on().then(Instant::now);
+                            let td = diag_on().then(Instant::now);
                             if let Err(e) = wal.sync() {
                                 fail("WAL sync failed", e);
                             } else {
                                 LAG_SYNCED[shard_id].store(wal.last_seq(), std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if let Some(td) = td {
+                                let ns = td.elapsed().as_nanos() as u64;
+                                diag_add(shard_id, 3, 1);
+                                diag_add(shard_id, 4, ns);
+                                DIAG[shard_id][5].fetch_max(ns, std::sync::atomic::Ordering::Relaxed);
+                                diag_add(shard_id, 9, 1);
+                                diag_event(shard_id, 1, td);
                             }
                             if let Some(t0) = t0 {
                                 wal_trace::synced(t0.elapsed(), 0);
@@ -1564,9 +1690,10 @@ fn open_shard(
     let (shard, wal) =
         recover_shard(&dir, id as u16, cfg.clone()).map_err(|e| format!("shard {id}: {e}"))?;
     eprintln!(
-        "shard {id} recovered in {:?} (last sequence {})",
+        "shard {id} recovered in {:?} (last sequence {}, replayed {})",
         started.elapsed(),
-        wal.last_seq()
+        wal.last_seq(),
+        wal.records_since_snapshot()
     );
     let since_snapshot = wal.records_since_snapshot();
     let mode = storage.durability;
