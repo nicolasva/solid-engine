@@ -212,3 +212,71 @@ pub fn stable_hash(channel_id: u16, key: &[u8]) -> u64 {
 pub fn shard_for(channel_id: u16, partition_key: &[u8], shard_count: usize) -> usize {
     (stable_hash(channel_id, partition_key) % shard_count as u64) as usize
 }
+
+/// Nombre maximal de shards adressables (`shard_id` tient dans un `u16`).
+pub const MAX_SHARDS: usize = 1 << 16;
+
+/// Table de compteurs indexée par shard, allouée à la demande : une entrée n'existe (et ne coûte de mémoire) que pour
+/// les shards effectivement utilisés. Lecture sans verrou (un chargement `Acquire`) ; l'entrée est créée au premier
+/// accès par `compare_exchange` (`AcqRel`/`Acquire`) : si deux threads courent, un seul pointeur est publié et
+/// l'allocation perdante, jamais visible d'un autre thread, est libérée aussitôt. Une entrée publiée n'est ni
+/// déplacée ni libérée avant la table elle-même. Destinée à des `static` (jamais libérés) ; `T: Send + Sync` est exigé
+/// parce que les entrées sont partagées entre threads.
+pub struct PerShard<T: 'static> {
+    slots: [std::sync::atomic::AtomicPtr<T>; MAX_SHARDS],
+}
+
+impl<T: Default + Send + Sync + 'static> PerShard<T> {
+    pub const fn new() -> Self {
+        Self { slots: [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; MAX_SHARDS] }
+    }
+
+    /// Entrée du shard, créée au besoin. Panique seulement si `shard >= MAX_SHARDS`.
+    #[inline]
+    pub fn get(&self, shard: usize) -> &T {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let slot = &self.slots[shard];
+        let p = slot.load(Acquire);
+        if !p.is_null() {
+            // SAFETY: le pointeur vient de `Box::into_raw` et n'est jamais libéré ni remplacé.
+            return unsafe { &*p };
+        }
+        let fresh = Box::into_raw(Box::new(T::default()));
+        match slot.compare_exchange(std::ptr::null_mut(), fresh, AcqRel, Acquire) {
+            // SAFETY: idem ; `fresh` est désormais publié.
+            Ok(_) => unsafe { &*fresh },
+            Err(existing) => {
+                // SAFETY: `fresh` n'a pas été publié, on en est l'unique propriétaire.
+                drop(unsafe { Box::from_raw(fresh) });
+                unsafe { &*existing }
+            }
+        }
+    }
+
+    /// Entrée du shard si elle existe déjà (pas d'allocation) ; `None` aussi hors bornes.
+    #[inline]
+    pub fn peek(&self, shard: usize) -> Option<&T> {
+        let p = self.slots.get(shard)?.load(std::sync::atomic::Ordering::Acquire);
+        // SAFETY: voir `get`.
+        (!p.is_null()).then(|| unsafe { &*p })
+    }
+}
+
+impl<T: Default + Send + Sync + 'static> Default for PerShard<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: 'static> Drop for PerShard<T> {
+    /// Les références rendues par `get`/`peek` empruntent la table : aucune n'existe quand on arrive ici.
+    fn drop(&mut self) {
+        for slot in &mut self.slots {
+            let p = *slot.get_mut();
+            if !p.is_null() {
+                // SAFETY: pointeur issu de `Box::into_raw`, publié une seule fois et jamais libéré avant.
+                drop(unsafe { Box::from_raw(p) });
+            }
+        }
+    }
+}

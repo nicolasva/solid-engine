@@ -137,6 +137,116 @@ Limites connues :
 
 Diagnostics : `SOLID_ENGINE_DISPATCH_TRACE=<fichier>` écrit les temps du dispatcher, du WAL (profondeur de file, fsync, snapshots) et des phases des shards (attente, `apply`, journalisation, réponses). Backlog préchargé (`BENCH_PRELOAD=1`, consommation seule) : 858 k à 956 k jobs/s, ce n'est pas un débit de bout en bout. Ne comparer entre eux que des runs d'un même binaire du banc.
 
+### Architecture de la persistance
+
+- **Shards** : chaque shard possède son état, son thread (`shard-N`) et son WAL (`<data_dir>/shard-N/`). Le shard applique les commandes en mémoire et journalise les mutations.
+- **Writer WAL** (`balanced`, `strict`) : un thread par shard reçoit les lots d'enregistrements, les écrit en séquence (trame = en-tête de 32 octets + payload + CRC32 de 4 octets) puis synchronise. En `strict`, les réponses voyagent avec le lot et sont libérées après le `fsync` (group commit).
+- **Snapshots** : tous les `snapshot_every_records` enregistrements, le shard encode son état, le writer le publie de façon atomique (fichier `.tmp`, `sync_all`, `rename`, `sync` du répertoire) puis supprime les segments WAL devenus inutiles.
+- **Récupération** (`recover_shard`) : supprime les `.tmp` ; charge le snapshot valide le plus récent (un snapshot corrompu n'est toléré que si le WAL restant couvre l'historique nécessaire) ; rejoue le WAL après la séquence du snapshot ; **tronque la fin déchirée du dernier segment** ; refuse de démarrer sur un CRC invalide hors de cette fin ou sur un trou de séquence. Les réservations (leases) de l'incarnation précédente sont ensuite invalidées de façon durable, avant toute nouvelle attribution : un job réservé avant le crash redevient disponible (livraison at-least-once).
+
+### Contrats de durabilité (ce qui est promis, et ce qui ne l'est pas)
+
+| | `strict` | `balanced` |
+|---|---|---|
+| Moment de la réponse | après le `fsync` du lot | après l'écriture dans la file du writer, **avant** le `fsync` |
+| ACK perdu après un crash du processus (SIGKILL) | non observé (aucune perte d'ACK dans les campagnes ci-dessous) | **possible** : toute opération confirmée mais pas encore écrite sur disque. Les campagnes ont observé des pertes de quelques dizaines à quelques centaines d'ACK, toutes sur des enregistrements absents du disque |
+| Fenêtre de perte | aucune perte d'opération confirmée n'est attendue après un `fsync` réussi, sous réserve des garanties effectivement fournies par le système de fichiers et le matériel | la quantité de données confirmées susceptible d'être perdue dépend du délai de synchronisation, de la charge et du retard du writer ; `sync_interval_ms` n'est pas une borne garantie de perte |
+| Corruption | CRC32 par trame ; aucune corruption ni rupture de séquence détectée dans les campagnes | idem |
+
+Le contrat de `strict` repose sur la sémantique du système et du matériel : voir « Limites ».
+
+### Temps de récupération (RTO) : ce qui a été mesuré
+
+Ces valeurs sont des **temps de reconstruction de l'état après SIGKILL dans les bancs de test**, pas un RTO garanti. Un RTO de production inclut aussi la détection de la panne, le redémarrage du processus et le retour au service, qui ne sont pas mesurés ici.
+
+| Banc | Données | Temps de récupération observé |
+|---|---|---|
+| E4, SIGKILL, payloads de 16 octets | quelques centaines à quelques milliers d'enregistrements par shard | 5 à 6 ms |
+| SIGKILL, payloads de 32 et 64 Ko | quelques dizaines de Mo de WAL au total | 10 à 40 ms |
+| Banc de performance, snapshots ≈ 23–25 Mo au total, 2 shards | snapshot + WAL de quelques centaines à quelques milliers d'enregistrements | ≈ 58 à 64 ms |
+
+Environnement : Linux (Docker Desktop, 6 CPU alloués, overlayfs), 2 shards, une seule graine pour les campagnes SIGKILL. Le temps de récupération croît avec la taille du snapshot et du WAL à rejouer ; il n'est pas extrapolable à des volumes de plusieurs Go.
+
+### Backpressure du WAL (`balanced`)
+
+Le shard envoie des lots au writer. Pour borner la mémoire des lots envoyés mais pas encore écrits, chaque shard attend, avant d'envoyer un nouveau lot, que le retard de son writer repasse **sous** le plafond :
+
+- `SOLID_MAX_PENDING_WAL_BYTES` : plafond en octets WAL (trames complètes) par shard. **Défaut : 67 108 864 (64 Mio).** `0` = illimité. L'ancien nom `SOLID_ENGINE_WAL_MAX_PENDING_BYTES` reste accepté ; une valeur non numérique est ignorée et le défaut s'applique. La valeur est lue une fois par processus.
+- `SOLID_ENGINE_WAL_MAX_PENDING_RECORDS` (expérimental) : même mécanisme en nombre d'enregistrements ; **0 (illimité) par défaut**. Les deux plafonds s'appliquent ensemble : dès que l'un est franchi, le shard attend.
+- L'octet est comptabilisé à l'envoi et libéré **après l'écriture** par le writer (pas après le `fsync`) : le plafond borne la mémoire du processus, pas la fenêtre de durabilité. Une erreur d'écriture ne libère rien ; l'attente est alors interrompue pour que l'erreur du writer soit publiée.
+- **Ce n'est pas une limite mémoire stricte et instantanée.** Le plafond est souple : un lot est envoyé dès que le retard déjà en file n'est pas au-dessus du plafond, donc le retard peut le dépasser d'**au plus un lot** (au maximum observé : ≈ 1,12 à 1,18 Mo pour un plafond de 1 Mio avec des payloads de 32 et 64 Ko). Les autres consommateurs de mémoire (snapshots, jobs, allocateur, tampons réseau) ne sont pas couverts.
+- L'attente bloque le thread du shard ; la contre-pression atteint les clients par les files et les tampons TCP. Le mode `strict` n'utilise pas ce plafond.
+- Observabilité : `solid_engine_server::engine::pending_wal_bytes(shard)`, et le champ `pwb=` de la ligne `wal_lag` si `SOLID_ENGINE_WAL_LAG` est défini.
+
+### Épinglage des threads (optionnel)
+
+`SOLID_PIN_THREADS=1` épingle le thread du shard `i` sur le cœur `i % n` de la liste renvoyée par `core_affinity::get_core_ids()`. **Désactivé par défaut.** L'attribution `shard -> core` est écrite sur stderr au démarrage ; un refus du système (cgroups, conteneur, macOS) produit un avertissement non bloquant. Ne concerne ni les threads WAL ni le mode `SOLID_ENGINE_REACTOR_DIRECT`. Aucune mesure de gain de latence n'a été faite pour cette option.
+
+### Worker de snapshot asynchrone (expérimental, désactivé par défaut)
+
+`SOLID_ENGINE_SNAPSHOT_WORKER=1` déporte la publication du snapshot (écriture, `sync_all`, `rename`) du writer vers un thread par shard ; le writer garde la frontière WAL, la rotation et le nettoyage. Il est validé en récupération (voir « Validation ») et réduit le retard du writer, mais, sous snapshots continus (`snapshot_every_records` = 20 dans le banc, un stress artificiel), il a été mesuré avec un débit inférieur de 2 à 5 % et un p50 supérieur d'environ 5 % (≈ 5 µs) ; la cause n'est pas identifiée. Sans snapshots fréquents, aucune différence détectable. **Ne pas l'activer en production.**
+
+### Configuration : valeurs par défaut vérifiées dans le code
+
+| Réglage | Défaut | Remarque |
+|---|---|---|
+| `storage.durability` | **`memory`** | `balanced` et `strict` exigent `storage.data_dir` |
+| `storage.sync_interval_ms` | 10 | doit être > 0 ; fréquence du `fsync` en `balanced` |
+| `storage.snapshot_every_records` | 100 000 | 0 = jamais ; `SOLID_ENGINE_SNAPSHOT_EVERY` prime |
+| `storage.snapshot_single_flight` | `false` | un seul snapshot en vol par shard ; `SOLID_ENGINE_SNAPSHOT_SINGLE_FLIGHT=1` ou `0` prime |
+| `SOLID_ENGINE_SNAPSHOT_MAX_CONCURRENT` | 0 (illimité) | expérimental : limite globale de snapshots simultanés |
+| `SOLID_MAX_PENDING_WAL_BYTES` | 64 Mio par shard | voir « Backpressure du WAL » |
+| `SOLID_PIN_THREADS` | désactivé | `1` pour activer |
+| `SOLID_ENGINE_SNAPSHOT_WORKER` | désactivé | `1` pour activer (expérimental) |
+| `engine.shards` / `engine.mailbox_capacity` | 4 / 4096 | |
+| `limits.max_payload_bytes` | 1 Mio | |
+| `limits.max_jobs_per_shard` | 1 000 000 | voir « Mémoire » |
+| `jobs.completed_retention_ms` | 60 000 | |
+
+Les variables d'environnement sont lues au démarrage du processus (une fois). Les campagnes de durabilité ont été exécutées avec 2 à 4 shards.
+
+**Dimensionnement des shards :** les modes `memory`, `balanced` et `strict` ont été testés avec 16, 17 et 32 shards. Les compteurs WAL sont désormais dimensionnés pour prendre en charge les identifiants de shards jusqu'à la limite de configuration de 65 535 shards. Les tests fonctionnels, de récupération et de performances n'ont pas été étendus à cette limite. Les mesures de performance présentées ne constituent pas une garantie de capacité à cette échelle.
+
+**Changement d'API des diagnostics :** avec la feature `wal-diagnostics`, les anciens tableaux publics `DIAG_ENCODE_NS` et `DIAG_WRITE_NS` sont remplacés par `diag_encode_ns(i)` et `diag_write_ns(i)`.
+
+### Fonctionnalités de test et de diagnostic (hors production)
+
+Désactivées par défaut et absentes du binaire standard :
+
+- feature Cargo `snapshot-fault-injection` : points d'arrêt et délais dans la publication des snapshots (`SOLID_ENGINE_TEST_SNAPSHOT_CRASH_AT`, `SOLID_ENGINE_TEST_SNAPSHOT_DELAY_MS`) ;
+- feature Cargo `wal-diagnostics` : compteurs et journal détaillés du writer, activés à l'exécution par `SOLID_ENGINE_WAL_LAG` ; `SOLID_ENGINE_WAL_LAG` seule imprime déjà un état du retard toutes les 100 ms.
+
+Les variables `SOLID_ENGINE_SNAPSHOT_SKIP_IO`, `SOLID_ENGINE_SPIN_*`, `SOLID_ENGINE_REACTOR_*`, `SOLID_ENGINE_WRITER_*` et `SOLID_ENGINE_*_STATS` sont expérimentales ou diagnostiques ; voir les sections de mesure plus bas.
+
+### Limites
+
+- **SIGKILL n'est pas une coupure d'alimentation.** Les campagnes tuent le processus ; le noyau conserve les écritures déjà passées au page cache. Aucune coupure d'alimentation n'a été testée.
+- **Sémantique du `fsync`** : le WAL utilise `File::sync_data`, et les snapshots `sync_all`. Avec la bibliothèque standard Rust 1.97.1, ils appellent `fsync`/`fdatasync` sous Linux et **`fcntl(F_FULLFSYNC)` sous macOS** (vérifié dans les sources de la `std` de cette version). La durabilité réelle dépend ensuite du système de fichiers, du cache d'écriture du disque et de la virtualisation.
+- **Les campagnes Linux ont tourné sur Docker Desktop (overlayfs, VM de 12 vCPU)**, pas sur un Linux natif ni sur du stockage de production.
+- Une graine par configuration pour les campagnes de gros payloads ; une exécution CI réussie ne démontre pas la stabilité statistique des tests de durabilité sur des runners partagés.
+- Les latences mesurent l'ACK, pas la persistance. Les débits des bancs ne sont pas des garanties.
+- En `balanced`, l'erreur d'I/O est détectée de façon asynchrone ; quelques réponses peuvent sortir avant sa détection.
+
+### Validation
+
+| Campagne | Contenu | Résultat |
+|---|---|---|
+| E4 | 120 SIGKILL appariés : strict et balanced, trois scénarios autour de la publication d'un snapshot, worker OFF/ON | aucune violation d'invariant observée |
+| E5 | 140 injections déterministes (arrêts aux frontières de publication) | aucune violation observée |
+| Non-régression 78c60f6 | 12 SIGKILL (payload de 16 octets), Linux/Docker | 12/12 |
+| Gros payloads | 24 SIGKILL, payloads de 32 et 64 Ko, plafond abaissé à 1 Mio | 24/24 ; `bad_crc=0`, aucun ACK perdu en `strict` ; plafond atteint dans les 4 runs dont le journal a pu être lu |
+| CI | 5 jobs GitHub Actions (tests standard, fault-injection, diagnostics, features combinées, clippy) | réussis sur un run |
+
+Commande de validation à conserver (la CI en inclut l'équivalent) :
+
+```
+cargo test --release -p solid-engine-server \
+  --features snapshot-fault-injection \
+  --test snapshot_worker_faults
+```
+
+Les campagnes SIGKILL (`e4_sigkill`, `e5_inject`) sont des bancs expérimentaux, non suivis dans git. Aucun interblocage n'a été observé, ce qui n'est pas une preuve d'absence d'interblocage.
+
 ### Mémoire : rétention des jobs terminés et dimensionnement
 
 Un job terminé laisse une entrée `Done` pendant `jobs.completed_retention_ms` (60 000 ms par défaut) : elle sert à la déduplication d'un `PushJob` rejoué, à `GetJob` et au contrôle du fencing. Redis, dans ce banc, supprime le job au `LREM` et ne garde rien : les RSS ne sont pas comparables à fonction égale.

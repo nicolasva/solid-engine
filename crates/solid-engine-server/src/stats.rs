@@ -271,9 +271,9 @@ fn snap_stats() -> String {
         SNAP_BACKLOG_MAX.load(Relaxed),
         SNAP_ENCODING_MAX.load(Relaxed),
         SNAPSHOTS_IN_FLIGHT_MAX.load(Relaxed),
-        SNAP_DEFERRED_BY_SHARD.iter().take(4).map(|a| a.load(Relaxed).to_string()).collect::<Vec<_>>().join("/"),
-        SNAP_DONE_BY_SHARD.iter().take(4).map(|a| a.load(Relaxed).to_string()).collect::<Vec<_>>().join("/"),
-        SNAP_BACKLOG_NOW.iter().take(4).map(|a| a.load(Relaxed).to_string()).collect::<Vec<_>>().join("/")
+        (0..4).map(|i| SNAP_DEFERRED_BY_SHARD[i].load(Relaxed).to_string()).collect::<Vec<_>>().join("/"),
+        (0..4).map(|i| SNAP_DONE_BY_SHARD[i].load(Relaxed).to_string()).collect::<Vec<_>>().join("/"),
+        (0..4).map(|i| SNAP_BACKLOG_NOW[i].load(Relaxed).to_string()).collect::<Vec<_>>().join("/")
     )
 }
 

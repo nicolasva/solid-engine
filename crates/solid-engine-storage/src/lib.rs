@@ -254,8 +254,18 @@ mod diag {
     /// Activé par le serveur quand `SOLID_ENGINE_WAL_LAG` est défini.
     pub static DIAG_ON: AtomicBool = AtomicBool::new(false);
     /// Temps d'encodage et de `write_all` par shard, cumulés en ns.
-    pub static DIAG_ENCODE_NS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
-    pub static DIAG_WRITE_NS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+    #[derive(Default)]
+    struct EncodeWriteNs {
+        encode: AtomicU64,
+        write: AtomicU64,
+    }
+    static ENCODE_WRITE_NS: solid_engine_core::PerShard<EncodeWriteNs> = solid_engine_core::PerShard::new();
+    pub fn diag_encode_ns(shard: usize) -> u64 {
+        ENCODE_WRITE_NS.peek(shard).map_or(0, |c| c.encode.load(Relaxed))
+    }
+    pub fn diag_write_ns(shard: usize) -> u64 {
+        ENCODE_WRITE_NS.peek(shard).map_or(0, |c| c.write.load(Relaxed))
+    }
     /// Phases d'un snapshot (µs) : sync WAL préalable, création+écriture, sync_all, rename, sync répertoire,
     /// nouveau segment, nettoyage. (shard, début µs, phases)
     pub static DIAG_SNAP: std::sync::Mutex<Vec<(u8, u64, [u64; 7])>> = std::sync::Mutex::new(Vec::new());
@@ -277,9 +287,9 @@ mod diag {
         }
         pub fn finish(self, shard_id: u16) {
             if let Some((t0, Some(t1))) = self.0 {
-                let sh = (shard_id as usize).min(15);
-                DIAG_ENCODE_NS[sh].fetch_add(t1.duration_since(t0).as_nanos() as u64, Relaxed);
-                DIAG_WRITE_NS[sh].fetch_add(t1.elapsed().as_nanos() as u64, Relaxed);
+                let c = ENCODE_WRITE_NS.get(shard_id as usize);
+                c.encode.fetch_add(t1.duration_since(t0).as_nanos() as u64, Relaxed);
+                c.write.fetch_add(t1.elapsed().as_nanos() as u64, Relaxed);
             }
         }
     }
@@ -333,7 +343,7 @@ mod diag {
 }
 
 #[cfg(feature = "wal-diagnostics")]
-pub use diag::{diag_epoch, DIAG_ENCODE_NS, DIAG_ON, DIAG_SNAP, DIAG_WRITE_NS};
+pub use diag::{diag_encode_ns, diag_epoch, diag_write_ns, DIAG_ON, DIAG_SNAP};
 use diag::{AppendTimer, SnapTimer};
 
 impl Wal {

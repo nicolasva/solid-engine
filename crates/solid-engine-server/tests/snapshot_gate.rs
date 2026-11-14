@@ -39,7 +39,7 @@ fn global_snapshot_limit_is_respected_fair_and_recoverable() {
     }
     assert!(SNAPSHOTS_IN_FLIGHT_MAX.load(SeqCst) <= 1, "plus d'un snapshot simultané : {}", SNAPSHOTS_IN_FLIGHT_MAX.load(SeqCst));
     assert!(SNAP_ENCODING_MAX.load(SeqCst) <= 1);
-    let done: Vec<usize> = SNAP_DONE_BY_SHARD.iter().take(4).map(|a| a.load(SeqCst)).collect();
+    let done: Vec<usize> = (0..4).map(|i| SNAP_DONE_BY_SHARD[i].load(SeqCst)).collect();
     assert!(done.iter().all(|&d| d >= 1), "un shard n'a jamais obtenu de snapshot (famine) : {done:?} ; reportés {}", SNAP_GATE_DEFERRED.load(SeqCst));
 
     let server = Server::start(config(&dir)).unwrap();

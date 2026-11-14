@@ -1243,7 +1243,7 @@ fn snapshot_release(shard_id: usize, state: Vec<u8>, flag: Option<&std::sync::at
     SNAP_LIVE_CAP.fetch_sub(state.capacity(), std::sync::atomic::Ordering::Relaxed);
     drop(state);
     SNAPSHOTS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    SNAP_DONE_BY_SHARD[shard_id.min(15)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SNAP_DONE_BY_SHARD[shard_id].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     snapshot_gate_release();
     if let Some(f) = flag {
         f.store(false, std::sync::atomic::Ordering::Release);
@@ -1276,9 +1276,62 @@ pub static SNAP_GATE_DEFERRED: std::sync::atomic::AtomicUsize = std::sync::atomi
 pub static SNAP_BACKLOG_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static SNAP_ENCODING_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static SNAP_ENCODING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub static SNAP_DEFERRED_BY_SHARD: [std::sync::atomic::AtomicUsize; 16] = [const { std::sync::atomic::AtomicUsize::new(0) }; 16];
-pub static SNAP_BACKLOG_NOW: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
-pub static SNAP_DONE_BY_SHARD: [std::sync::atomic::AtomicUsize; 16] = [const { std::sync::atomic::AtomicUsize::new(0) }; 16];
+/// Compteurs par shard, alloués à la demande pour le nombre réel de shards (aucune limite fixe) et regroupés par
+/// producteur pour éviter le faux partage : le thread du shard écrit `prod`, le writer WAL écrit `cons`.
+#[derive(Default)]
+#[repr(align(64))]
+struct ProdCtr {
+    lag_sent: std::sync::atomic::AtomicU64,
+    bytes_sent: std::sync::atomic::AtomicU64,
+}
+#[derive(Default)]
+#[repr(align(64))]
+struct ConsCtr {
+    lag_written: std::sync::atomic::AtomicU64,
+    lag_synced: std::sync::atomic::AtomicU64,
+    lag_snap: std::sync::atomic::AtomicU64,
+    bytes_written: std::sync::atomic::AtomicU64,
+}
+#[derive(Default)]
+#[repr(align(64))]
+struct SnapCtr {
+    deferred: std::sync::atomic::AtomicUsize,
+    backlog_now: std::sync::atomic::AtomicU64,
+    done: std::sync::atomic::AtomicUsize,
+}
+#[derive(Default)]
+struct ShardCtr {
+    prod: ProdCtr,
+    cons: ConsCtr,
+    snap: SnapCtr,
+}
+static SHARD_CTR: solid_engine_core::PerShard<ShardCtr> = solid_engine_core::PerShard::new();
+/// Plus grand nombre de shards dont un writer WAL a démarré dans ce processus (bornes des affichages de diagnostic).
+static WAL_SHARDS_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Vue indexée par shard d'un champ de `ShardCtr` : `LAG_SENT[shard]` reste valable pour tout `shard < 65 536`.
+macro_rules! shard_field {
+    ($name:ident, $t:ty, $($f:ident).+) => {
+        #[allow(non_camel_case_types)]
+        pub struct $name;
+        impl std::ops::Index<usize> for $name {
+            type Output = $t;
+            #[inline]
+            fn index(&self, shard: usize) -> &$t {
+                &SHARD_CTR.get(shard)$(.$f)+
+            }
+        }
+    };
+}
+shard_field!(SNAP_DEFERRED_BY_SHARD, std::sync::atomic::AtomicUsize, snap.deferred);
+shard_field!(SNAP_BACKLOG_NOW, std::sync::atomic::AtomicU64, snap.backlog_now);
+shard_field!(SNAP_DONE_BY_SHARD, std::sync::atomic::AtomicUsize, snap.done);
+shard_field!(LAG_SENT, std::sync::atomic::AtomicU64, prod.lag_sent);
+shard_field!(BYTES_SENT, std::sync::atomic::AtomicU64, prod.bytes_sent);
+shard_field!(LAG_WRITTEN, std::sync::atomic::AtomicU64, cons.lag_written);
+shard_field!(LAG_SYNCED, std::sync::atomic::AtomicU64, cons.lag_synced);
+shard_field!(LAG_SNAP, std::sync::atomic::AtomicU64, cons.lag_snap);
+shard_field!(BYTES_WRITTEN, std::sync::atomic::AtomicU64, cons.bytes_written);
 
 fn snapshot_gate_acquire() -> bool {
     use std::sync::atomic::Ordering::SeqCst;
@@ -1297,24 +1350,20 @@ fn snapshot_gate_release() {
 /// Le shard n'attend jamais le disque, et l'écriture et le fsync concurrents ne le ralentissent plus.
 /// Une erreur d'I/O est publiée dans `error` et fait passer le shard en échec.
 // EXPERIMENTAL (camp28) : retard du writer par shard, lu à 10 Hz si SOLID_ENGINE_WAL_LAG est défini.
-pub static LAG_SENT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
-pub static LAG_WRITTEN: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
-pub static LAG_SYNCED: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
-pub static BYTES_SENT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
-pub static BYTES_WRITTEN: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 /// Plafond par défaut, par shard, des octets WAL envoyés au writer et pas encore écrits (0 = illimité).
 pub const DEFAULT_MAX_PENDING_WAL_BYTES: u64 = 67_108_864;
 
 /// Octets WAL envoyés au writer du shard et pas encore écrits (ne décroît pas si l'écriture échoue).
 pub fn pending_wal_bytes(shard: usize) -> u64 {
     let l = std::sync::atomic::Ordering::Relaxed;
-    BYTES_SENT[shard].load(l).saturating_sub(BYTES_WRITTEN[shard].load(l))
+    SHARD_CTR.peek(shard).map_or(0, |c| {
+        c.prod.bytes_sent.load(l).saturating_sub(c.cons.bytes_written.load(l))
+    })
 }
 /// Maximum observé de (octets envoyés non écrits + fournée en cours d'envoi) et taille maximale d'une fournée.
 pub static BYTES_PEND_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BYTES_BATCH_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BP_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static LAG_SNAP: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 
 /// Diagnostic du writer (camp35, feature `wal-diagnostics`). Sans la feature, les fonctions ci-dessous sont des
 /// no-op en ligne : le chemin du writer ne porte ni compteurs, ni journal, ni thread d'échantillonnage.
@@ -1331,7 +1380,19 @@ mod diag {
 
     /// [appends, records, batch_max, sync_n, sync_ns, sync_max_ns, idle_ns, wakes, append_ns, sync_timer_n].
     pub const DIAG_FIELDS: usize = 10;
-    pub static DIAG: [[AtomicU64; DIAG_FIELDS]; 16] = [const { [const { AtomicU64::new(0) }; DIAG_FIELDS] }; 16];
+    #[derive(Default)]
+    pub struct DiagRow([AtomicU64; DIAG_FIELDS]);
+    static DIAG_ROWS: solid_engine_core::PerShard<DiagRow> = solid_engine_core::PerShard::new();
+    /// `DIAG[shard]` : champs du writer du shard, alloués à la demande (aucune limite fixe de shards).
+    #[allow(non_camel_case_types)]
+    pub struct DIAG;
+    impl std::ops::Index<usize> for DIAG {
+        type Output = [AtomicU64; DIAG_FIELDS];
+        #[inline]
+        fn index(&self, shard: usize) -> &Self::Output {
+            &DIAG_ROWS.get(shard).0
+        }
+    }
 
     /// camp35-D : journal d'événements du writer (shard, genre 0=append 1=sync 2=snapshot, début µs, durée µs).
     /// Les appends < 100 µs ne sont pas journalisés (ils sont comptés dans l'histogramme `DIAG_H`).
@@ -1399,6 +1460,7 @@ fn start_lag_printer(shards: usize) {
             loop {
                 std::thread::sleep(Duration::from_millis(100));
                 let l = std::sync::atomic::Ordering::Relaxed;
+                let shards = shards.max(WAL_SHARDS_SEEN.load(l));
                 #[cfg(feature = "wal-diagnostics")]
                 let snapc = format!(" snapc={}", SNAP_CNT.iter().map(|c| c.load(l).to_string()).collect::<Vec<_>>().join(","));
                 #[cfg(not(feature = "wal-diagnostics"))]
@@ -1409,14 +1471,14 @@ fn start_lag_printer(shards: usize) {
                     BP_WAIT_US.load(l),
                     BYTES_PEND_MAX.load(l),
                     BYTES_BATCH_MAX.load(l),
-                    (0..shards.min(16)).map(|i| BYTES_WRITTEN[i].load(l)).sum::<u64>()
+                    (0..shards).map(|i| BYTES_WRITTEN[i].load(l)).sum::<u64>()
                 );
-                for i in 0..shards.min(16) {
+                for i in 0..shards {
                     let l = std::sync::atomic::Ordering::Relaxed;
                     line += &format!(" {i}:{},{},{},{}", LAG_SENT[i].load(l), LAG_WRITTEN[i].load(l), LAG_SYNCED[i].load(l), LAG_SNAP[i].load(l));
                 }
                 line += " pwb=";
-                line += &(0..shards.min(16)).map(|i| pending_wal_bytes(i).to_string()).collect::<Vec<_>>().join(",");
+                line += &(0..shards).map(|i| pending_wal_bytes(i).to_string()).collect::<Vec<_>>().join(",");
                 eprintln!("{line}");
                 #[cfg(feature = "wal-diagnostics")]
                 print_diag_counters(shards, t0);
@@ -1463,7 +1525,8 @@ fn start_diag_sampler(shards: usize) {
 fn print_diag_counters(shards: usize, t0: Instant) {
     let l = std::sync::atomic::Ordering::Relaxed;
     let mut d = format!("wal_diag t={}", t0.elapsed().as_millis());
-    for (i, row) in DIAG.iter().enumerate().take(shards.min(16)) {
+    for i in 0..shards {
+        let row = &DIAG[i];
         let v: Vec<u64> = row.iter().map(|x| x.load(l)).collect();
         if v.iter().all(|x| *x == 0) {
             continue;
@@ -1471,8 +1534,8 @@ fn print_diag_counters(shards: usize, t0: Instant) {
         d += &format!(
             " {i}:{},{},{},{},{},{},{},{},{},{},{},{}",
             v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9],
-            solid_engine_storage::DIAG_ENCODE_NS[i].load(l),
-            solid_engine_storage::DIAG_WRITE_NS[i].load(l)
+            solid_engine_storage::diag_encode_ns(i),
+            solid_engine_storage::diag_write_ns(i)
         );
     }
     eprintln!("{d}");
@@ -1509,6 +1572,8 @@ impl WalWriter {
         let done_slot_thread = done_slot.clone();
         {
             let l = std::sync::atomic::Ordering::Relaxed;
+            // Crée l'entrée de compteurs hors chemin critique et publie le nombre de shards pour les diagnostics.
+            WAL_SHARDS_SEEN.fetch_max(shard_id + 1, l);
             LAG_SENT[shard_id].store(wal.last_seq(), l);
             LAG_WRITTEN[shard_id].store(wal.last_seq(), l);
             LAG_SYNCED[shard_id].store(wal.last_seq(), l);
@@ -1774,7 +1839,7 @@ impl WalWriter {
                             SNAP_LIVE_CAP.fetch_sub(state.capacity(), std::sync::atomic::Ordering::Relaxed);
                             drop(state);
                             SNAPSHOTS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                            SNAP_DONE_BY_SHARD[shard_id.min(15)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            SNAP_DONE_BY_SHARD[shard_id].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             snapshot_gate_release();
                             writer_flag.store(false, std::sync::atomic::Ordering::Release);
                         }
@@ -2025,7 +2090,7 @@ pub(crate) fn flush(
         let busy = d.single_flight
             && d.writer.as_ref().is_some_and(|w| w.snapshot_in_flight.load(std::sync::atomic::Ordering::Acquire));
         let due_now = failed.is_none() && every > 0 && d.since_snapshot >= every && !busy;
-        SNAP_BACKLOG_NOW[(shard.id() as usize).min(15)].store(d.since_snapshot, std::sync::atomic::Ordering::Relaxed);
+        SNAP_BACKLOG_NOW[shard.id() as usize].store(d.since_snapshot, std::sync::atomic::Ordering::Relaxed);
         if due_now {
             SNAP_BACKLOG_MAX.fetch_max(d.since_snapshot, std::sync::atomic::Ordering::Relaxed);
         }
@@ -2033,7 +2098,7 @@ pub(crate) fn flush(
         let admitted = !gated || snapshot_gate_acquire();
         if gated && !admitted {
             SNAP_GATE_DEFERRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            SNAP_DEFERRED_BY_SHARD[(shard.id() as usize).min(15)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SNAP_DEFERRED_BY_SHARD[shard.id() as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if due_now && admitted {
             let t_snap = Instant::now();
