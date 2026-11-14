@@ -6,16 +6,38 @@
 use solid_engine_core::config::Config;
 use solid_engine_core::shard::Shard;
 use solid_engine_core::*;
-use solid_engine_storage::{recover_shard, Wal, INJECT_IO_ERROR};
+use solid_engine_storage::{recover_shard_at, Wal, INJECT_IO_ERROR};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const MAGIC_LEN: u64 = 8;
 // Le drapeau d'injection est global au processus : les tests du fichier sont sérialisés.
 static SERIAL: Mutex<()> = Mutex::new(());
+
+// Horloge virtuelle : toutes les dates passées au moteur et à la récupération en dérivent, jamais de l'horloge
+// murale (une veille ou un saut d'horloge dépassant la rétention des jobs terminés purgerait les jobs attendus).
+// Comme le drapeau d'injection, elle est globale au processus : les tests du fichier sont sérialisés.
+const T0: u64 = 1_700_000_000_000;
+static CLOCK: AtomicU64 = AtomicU64::new(T0);
+
+fn reset_clock() {
+    CLOCK.store(T0, Ordering::SeqCst);
+}
+
+fn clock_now() -> u64 {
+    CLOCK.load(Ordering::SeqCst)
+}
+
+fn advance_clock(ms: u64) {
+    CLOCK.fetch_add(ms, Ordering::SeqCst);
+}
+
+fn recover(dir: &Path) -> std::result::Result<(Shard, Wal), solid_engine_storage::StorageError> {
+    recover_shard_at(dir, 0, cfg(), clock_now())
+}
 
 struct Rng(u64);
 impl Rng {
@@ -85,7 +107,7 @@ fn after_recovery(m: &Model) -> Model {
 fn observed(shard: &mut Shard, upto: u128) -> Model {
     let mut out = Model::new();
     for id in 1..=upto {
-        if let Ok(v) = shard.get(id, now_ms()) {
+        if let Ok(v) = shard.get(id, clock_now()) {
             out.insert(id, v.state);
         }
     }
@@ -128,7 +150,7 @@ impl Run {
 
     fn new(tag: &str) -> Self {
         let dir = TempDir::new(tag);
-        let (shard, wal) = recover_shard(&dir.0, 0, cfg()).unwrap();
+        let (shard, wal) = recover(&dir.0).unwrap();
         let mut r = Self { shard, wal, dir, model: Model::new(), entries: vec![], synced: 0, next_id: 1, claims: vec![] };
         r.entries.push(Entry { len: r.seg_len(), model: Model::new() });
         r
@@ -136,7 +158,8 @@ impl Run {
 
     /// Applique une opération aléatoire au moteur et au modèle, puis vérifie leur accord immédiat.
     fn op(&mut self, rng: &mut Rng, seed: u64) {
-        let now = now_ms();
+        advance_clock(1);
+        let now = clock_now();
         match rng.below(10) {
             0..=3 => {
                 let id = self.next_id;
@@ -197,12 +220,13 @@ fn truncated_copy(run: &Run, len: u64, tag: &str) -> TempDir {
 fn check_prefix(run: &Run, len: u64, tag: &str, seed: u64) -> TempDir {
     let d = truncated_copy(run, len, tag);
     let want = run.entries.iter().rev().find(|e| e.len <= len).map(|e| e.model.clone()).unwrap_or_default();
-    let (mut shard, _) = recover_shard(&d.0, 0, cfg()).unwrap_or_else(|e| panic!("seed {seed} {tag} len={len}: {e:?}"));
+    let (mut shard, _) = recover(&d.0).unwrap_or_else(|e| panic!("seed {seed} {tag} len={len}: {e:?}"));
     assert_eq!(observed(&mut shard, run.next_id), after_recovery(&want), "seed {seed} {tag} len={len}");
     d
 }
 
 fn one_seed(seed: u64) {
+    reset_clock();
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let mut run = Run::new("run");
     let n_ops = 20 + rng.below(60);
@@ -262,16 +286,16 @@ fn one_seed(seed: u64) {
     }
 
     // Le journal récupéré reste appendable et stable à travers des redémarrages répétés.
-    let (mut shard, mut wal) = recover_shard(&d.0, 0, cfg()).unwrap();
+    let (mut shard, mut wal) = recover(&d.0).unwrap();
     let mut want = after_recovery(&run.entries.last().unwrap().model);
     let id = run.next_id;
-    shard.push(push_req(id), now_ms()).unwrap();
+    shard.push(push_req(id), clock_now()).unwrap();
     want.insert(id, JobState::Ready);
     wal.append(&shard.take_log()).unwrap();
     wal.sync().unwrap();
     drop((shard, wal));
     for _ in 0..3 {
-        let (mut shard, wal) = recover_shard(&d.0, 0, cfg()).unwrap();
+        let (mut shard, wal) = recover(&d.0).unwrap();
         assert_eq!(observed(&mut shard, id), want, "seed {seed}: redémarrage répété");
         drop(wal);
     }
@@ -288,7 +312,7 @@ fn one_seed(seed: u64) {
         let pos = MAGIC_LEN as usize + rng.below(bytes.len() as u64 - MAGIC_LEN) as usize;
         bytes[pos] ^= 1 << rng.below(8);
         fs::write(&seg, bytes).unwrap();
-        if let Ok((mut shard, _)) = recover_shard(&d.0, 0, cfg()) {
+        if let Ok((mut shard, _)) = recover(&d.0) {
             let got = observed(&mut shard, run.next_id);
             let ok = run.entries.iter().any(|e| after_recovery(&e.model) == got);
             assert!(ok, "seed {seed}: bit flip à {pos} a produit un état hors de tout préfixe valide");
@@ -308,4 +332,51 @@ fn wal_matches_reference_model_under_crashes_and_faults() {
     for seed in seeds() {
         one_seed(seed);
     }
+}
+
+fn recovered_at(dir: &Path, upto: u128, now: u64) -> Model {
+    let (mut shard, _) = recover_shard_at(dir, 0, cfg(), now).unwrap();
+    let mut out = Model::new();
+    for id in 1..=upto {
+        if let Ok(v) = shard.get(id, now) {
+            out.insert(id, v.state);
+        }
+    }
+    out
+}
+
+/// La purge des jobs terminés dépend uniquement de l'horloge fournie : avant l'échéance l'état est intact,
+/// à l'échéance (et après une avance de plus de 60 s) les jobs en état terminal (terminé, annulé) disparaissent
+/// et les jobs prêts ou réservés (devenus prêts à la récupération) subsistent.
+#[test]
+fn completed_retention_follows_the_virtual_clock() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    reset_clock();
+    let retention = cfg().jobs.completed_retention_ms;
+    assert_eq!(retention, 60_000, "la rétention par défaut sert de référence au test");
+
+    let dir = TempDir::new("retention");
+    let (mut shard, mut wal) = recover(&dir.0).unwrap();
+    let t0 = clock_now();
+    for id in 1..=4 {
+        shard.push(push_req(id), t0).unwrap();
+    }
+    let done = shard.claim(1, 600_000, t0).unwrap().unwrap();
+    shard.ack(Reservation { job_id: done.job_id, reservation_id: done.reservation_id, fencing_token: done.fencing_token }, t0).unwrap();
+    let held = shard.claim(1, 600_000, t0).unwrap().unwrap();
+    shard.cancel(4, t0).unwrap();
+    wal.append(&shard.take_log()).unwrap();
+    wal.sync().unwrap();
+    drop((shard, wal));
+    assert_eq!((done.job_id, held.job_id), (1, 2));
+
+    let kept = Model::from([(1, JobState::Completed), (2, JobState::Ready), (3, JobState::Ready), (4, JobState::Cancelled)]);
+    assert_eq!(recovered_at(&dir.0, 4, t0), kept);
+    assert_eq!(recovered_at(&dir.0, 4, t0 + retention - 1), kept, "juste avant l'échéance");
+    let purged = Model::from([(2, JobState::Ready), (3, JobState::Ready)]);
+    assert_eq!(recovered_at(&dir.0, 4, t0 + retention), purged, "à l'échéance");
+    assert_eq!(recovered_at(&dir.0, 4, t0 + 61_000), purged, "après une avance simulée de 61 s");
+    assert_eq!(recovered_at(&dir.0, 4, t0 + 3_600_000), purged, "après une avance d'une heure");
+    // La récupération est rejouée à partir du journal : relire à l'instant d'origine redonne l'état complet.
+    assert_eq!(recovered_at(&dir.0, 4, t0), kept);
 }

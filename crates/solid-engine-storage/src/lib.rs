@@ -503,6 +503,13 @@ fn read_snapshot(path: &Path, shard_id: u16) -> Result<(u64, Vec<u8>), StorageEr
 /// Récupère l'état d'un shard : dernier snapshot valide, puis replay des enregistrements WAL valides.
 /// Retourne le shard (journalisation activée) et le WAL prêt à recevoir de nouvelles écritures.
 pub fn recover_shard(dir: &Path, shard_id: u16, cfg: Arc<Config>) -> Result<(Shard, Wal), StorageError> {
+    recover_shard_at(dir, shard_id, cfg, solid_engine_core::now_ms())
+}
+
+/// Comme `recover_shard`, avec l'instant de fin de récupération (ms UTC) fourni par l'appelant :
+/// il pilote l'invalidation des réservations et la purge des jobs terminés. Les tests l'utilisent
+/// avec une horloge virtuelle ; la production passe par `recover_shard` et l'horloge murale.
+pub fn recover_shard_at(dir: &Path, shard_id: u16, cfg: Arc<Config>, now: u64) -> Result<(Shard, Wal), StorageError> {
     fs::create_dir_all(dir)?;
     // Les `.tmp` sont des snapshots interrompus : ils n'ont jamais été visibles.
     for entry in fs::read_dir(dir)? {
@@ -594,7 +601,7 @@ pub fn recover_shard(dir: &Path, shard_id: u16, cfg: Arc<Config>) -> Result<(Sha
 
     // Invalidation durable des réservations de l'ancienne incarnation avant toute attribution.
     shard.set_logging(true);
-    shard.finish_recovery(solid_engine_core::now_ms());
+    shard.finish_recovery(now);
     let records = shard.take_log();
     wal.append(&records)?;
     wal.sync()?;
