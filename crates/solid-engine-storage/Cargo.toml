@@ -12,3 +12,9 @@ readme = "README.md"
 [dependencies]
 solid-engine-core = { path = "../solid-engine-core", version = "1.1.1", default-features = false }
 crc32fast.workspace = true
+
+[features]
+# Désactivées par défaut. Hooks de crash/panne/délai de snapshot pilotés par SOLID_ENGINE_TEST_* (validation uniquement).
+snapshot-fault-injection = []
+# Minuteurs de diagnostic du WAL (campagnes de mesure uniquement).
+wal-diagnostics = []

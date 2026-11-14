@@ -152,12 +152,17 @@ fn injected() -> io::Result<()> {
 }
 
 /// Tests (camp35-E, chemin `snapshot_begin`/`publish`/`snapshot_finish`) : frontière (1..=6) où une erreur d'I/O est injectée.
+/// Compilé uniquement avec la feature `snapshot-fault-injection`.
+#[cfg(feature = "snapshot-fault-injection")]
 #[doc(hidden)]
 pub static SNAPSHOT_FAIL_AT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Frontières de publication d'un snapshot : 1 avant création du .tmp, 2 après écriture, 3 après sync_all,
 /// 4 après rename, 5 avant rotation du segment, 6 après rotation et avant nettoyage.
-/// `SOLID_ENGINE_TEST_SNAPSHOT_CRASH_AT=n` arrête brutalement le processus (équivalent d'un SIGKILL) à la frontière n.
+/// Avec la feature `snapshot-fault-injection`, `SOLID_ENGINE_TEST_SNAPSHOT_CRASH_AT=n` arrête brutalement le
+/// processus (équivalent d'un SIGKILL) à la frontière n. Sans la feature, c'est un no-op : aucune variable
+/// d'environnement n'est lue.
+#[cfg(feature = "snapshot-fault-injection")]
 fn boundary(n: u8) -> io::Result<()> {
     static CRASH: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     let crash = *CRASH.get_or_init(|| std::env::var("SOLID_ENGINE_TEST_SNAPSHOT_CRASH_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
@@ -168,6 +173,25 @@ fn boundary(n: u8) -> io::Result<()> {
         return Err(io::Error::other(format!("injected snapshot failure at boundary {n}")));
     }
     Ok(())
+}
+
+#[cfg(not(feature = "snapshot-fault-injection"))]
+#[inline(always)]
+fn boundary(_n: u8) -> io::Result<()> {
+    Ok(())
+}
+
+/// Délai de snapshot (ms) imposé par `SOLID_ENGINE_TEST_SNAPSHOT_DELAY_MS` (feature `snapshot-fault-injection`).
+#[cfg(feature = "snapshot-fault-injection")]
+fn env_snapshot_delay_ms() -> u64 {
+    static ENV_DELAY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ENV_DELAY.get_or_init(|| std::env::var("SOLID_ENGINE_TEST_SNAPSHOT_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+#[cfg(not(feature = "snapshot-fault-injection"))]
+#[inline(always)]
+fn env_snapshot_delay_ms() -> u64 {
+    0
 }
 
 /// Publication d'un snapshot hors du thread du writer (camp35-E). Le writer garde la frontière WAL (`seq`),
@@ -181,9 +205,7 @@ pub struct SnapshotJob {
 impl SnapshotJob {
     /// Écrit `snap-{seq}.snap` de façon atomique (tmp, sync_all, rename, sync du répertoire).
     pub fn publish(&self, state: &[u8]) -> io::Result<()> {
-        static ENV_DELAY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let env = *ENV_DELAY.get_or_init(|| std::env::var("SOLID_ENGINE_TEST_SNAPSHOT_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
-        let delay = SNAPSHOT_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed).max(env);
+        let delay = SNAPSHOT_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed).max(env_snapshot_delay_ms());
         if delay > 0 {
             std::thread::sleep(std::time::Duration::from_millis(delay));
         }
@@ -222,18 +244,97 @@ pub struct Wal {
     unsynced: bool,
 }
 
-/// Diagnostic (camp35, `SOLID_ENGINE_WAL_LAG`) : temps d'encodage et de `write_all` par shard, cumulés en ns.
-pub static DIAG_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub static DIAG_ENCODE_NS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
-pub static DIAG_WRITE_NS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+/// Diagnostic du WAL (camp35). Compilé uniquement avec la feature `wal-diagnostics` ; sans elle, les minuteurs
+/// ci-dessous sont des types vides dont les méthodes sont des no-op (aucun coût sur le chemin de production).
+#[cfg(feature = "wal-diagnostics")]
+mod diag {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    use std::time::Instant;
 
-pub fn diag_epoch() -> std::time::Instant {
-    static T: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    *T.get_or_init(std::time::Instant::now)
+    /// Activé par le serveur quand `SOLID_ENGINE_WAL_LAG` est défini.
+    pub static DIAG_ON: AtomicBool = AtomicBool::new(false);
+    /// Temps d'encodage et de `write_all` par shard, cumulés en ns.
+    pub static DIAG_ENCODE_NS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+    pub static DIAG_WRITE_NS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+    /// Phases d'un snapshot (µs) : sync WAL préalable, création+écriture, sync_all, rename, sync répertoire,
+    /// nouveau segment, nettoyage. (shard, début µs, phases)
+    pub static DIAG_SNAP: std::sync::Mutex<Vec<(u8, u64, [u64; 7])>> = std::sync::Mutex::new(Vec::new());
+
+    pub fn diag_epoch() -> Instant {
+        static T: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *T.get_or_init(Instant::now)
+    }
+
+    pub struct AppendTimer(Option<(Instant, Option<Instant>)>);
+    impl AppendTimer {
+        pub fn start() -> Self {
+            Self(DIAG_ON.load(Relaxed).then(|| (Instant::now(), None)))
+        }
+        pub fn encoded(&mut self) {
+            if let Some((_, w)) = &mut self.0 {
+                *w = Some(Instant::now());
+            }
+        }
+        pub fn finish(self, shard_id: u16) {
+            if let Some((t0, Some(t1))) = self.0 {
+                let sh = (shard_id as usize).min(15);
+                DIAG_ENCODE_NS[sh].fetch_add(t1.duration_since(t0).as_nanos() as u64, Relaxed);
+                DIAG_WRITE_NS[sh].fetch_add(t1.elapsed().as_nanos() as u64, Relaxed);
+            }
+        }
+    }
+
+    pub struct SnapTimer {
+        start: Option<Instant>,
+        mark: Instant,
+        ph: [u64; 7],
+    }
+    impl SnapTimer {
+        pub fn start() -> Self {
+            Self { start: DIAG_ON.load(Relaxed).then(Instant::now), mark: Instant::now(), ph: [0; 7] }
+        }
+        pub fn lap(&mut self, i: usize) {
+            self.ph[i] = self.mark.elapsed().as_micros() as u64;
+            self.mark = Instant::now();
+        }
+        pub fn finish(self, shard_id: u16) {
+            if let Some(t) = self.start {
+                DIAG_SNAP.lock().unwrap().push((shard_id as u8, t.duration_since(diag_epoch()).as_micros() as u64, self.ph));
+            }
+        }
+    }
 }
-/// Phases d'un snapshot (µs) : sync WAL préalable, création+écriture, sync_all, rename, sync répertoire,
-/// nouveau segment, nettoyage. (shard, début µs, phases)
-pub static DIAG_SNAP: std::sync::Mutex<Vec<(u8, u64, [u64; 7])>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(not(feature = "wal-diagnostics"))]
+mod diag {
+    pub struct AppendTimer;
+    impl AppendTimer {
+        #[inline(always)]
+        pub fn start() -> Self {
+            Self
+        }
+        #[inline(always)]
+        pub fn encoded(&mut self) {}
+        #[inline(always)]
+        pub fn finish(self, _shard_id: u16) {}
+    }
+
+    pub struct SnapTimer;
+    impl SnapTimer {
+        #[inline(always)]
+        pub fn start() -> Self {
+            Self
+        }
+        #[inline(always)]
+        pub fn lap(&mut self, _i: usize) {}
+        #[inline(always)]
+        pub fn finish(self, _shard_id: u16) {}
+    }
+}
+
+#[cfg(feature = "wal-diagnostics")]
+pub use diag::{diag_epoch, DIAG_ENCODE_NS, DIAG_ON, DIAG_SNAP, DIAG_WRITE_NS};
+use diag::{AppendTimer, SnapTimer};
 
 impl Wal {
     pub fn last_seq(&self) -> u64 {
@@ -251,7 +352,7 @@ impl Wal {
     /// Ajoute un lot d'enregistrements en une seule écriture (group commit).
     pub fn append(&mut self, records: &[Record]) -> io::Result<()> {
         injected()?;
-        let diag = DIAG_ON.load(std::sync::atomic::Ordering::Relaxed).then(std::time::Instant::now);
+        let mut timer = AppendTimer::start();
         let mut buf = Vec::new();
         for rec in records {
             let payload = rec.encode_payload();
@@ -267,14 +368,10 @@ impl Wal {
             buf.extend_from_slice(&crc.to_le_bytes());
             self.next_seq += 1;
         }
-        let written = diag.map(|_| std::time::Instant::now());
+        timer.encoded();
         // En cas d'échec d'I/O, le WAL est considéré comme défaillant et n'est plus utilisé.
         self.file.write_all(&buf)?;
-        if let (Some(t0), Some(t1)) = (diag, written) {
-            let sh = (self.shard_id as usize).min(15);
-            DIAG_ENCODE_NS[sh].fetch_add(t1.duration_since(t0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            DIAG_WRITE_NS[sh].fetch_add(t1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        }
+        timer.finish(self.shard_id);
         self.since_snapshot += records.len() as u64;
         self.unsynced = true;
         Ok(())
@@ -335,21 +432,13 @@ impl Wal {
     /// Écrit un snapshot de l'état courant (tous les enregistrements déjà ajoutés y sont inclus),
     /// ouvre un nouveau segment puis supprime l'historique devenu inutile.
     pub fn snapshot(&mut self, state: &[u8]) -> io::Result<()> {
-        static ENV_DELAY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let env = *ENV_DELAY.get_or_init(|| std::env::var("SOLID_ENGINE_TEST_SNAPSHOT_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
-        let delay = SNAPSHOT_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed).max(env);
+        let delay = SNAPSHOT_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed).max(env_snapshot_delay_ms());
         if delay > 0 {
             std::thread::sleep(std::time::Duration::from_millis(delay));
         }
-        let diag = DIAG_ON.load(std::sync::atomic::Ordering::Relaxed).then(std::time::Instant::now);
-        let mut ph = [0u64; 7];
-        let mut mark = std::time::Instant::now();
-        let mut lap = |i: usize, ph: &mut [u64; 7]| {
-            ph[i] = mark.elapsed().as_micros() as u64;
-            mark = std::time::Instant::now();
-        };
+        let mut timer = SnapTimer::start();
         self.sync()?;
-        lap(0, &mut ph);
+        timer.lap(0);
         let seq = self.last_seq();
         if seq == self.snapshot_seq {
             return Ok(());
@@ -370,20 +459,20 @@ impl Wal {
         f.write_all(&head)?;
         f.write_all(state)?;
         f.write_all(&crc.to_le_bytes())?;
-        lap(1, &mut ph);
+        timer.lap(1);
         f.sync_all()?;
-        lap(2, &mut ph);
+        timer.lap(2);
         fs::rename(&tmp, self.dir.join(snapshot_name(seq)))?;
-        lap(3, &mut ph);
+        timer.lap(3);
         sync_dir(&self.dir)?;
-        lap(4, &mut ph);
+        timer.lap(4);
 
         let new_first = seq + 1;
         if new_first != self.segment_first_seq {
             self.file = create_segment(&self.dir, new_first)?;
             self.segment_first_seq = new_first;
         }
-        lap(5, &mut ph);
+        timer.lap(5);
         for (first, path) in list(&self.dir, "wal-", ".log")? {
             if first < new_first {
                 fs::remove_file(path)?;
@@ -394,10 +483,8 @@ impl Wal {
                 fs::remove_file(path)?;
             }
         }
-        lap(6, &mut ph);
-        if let Some(t) = diag {
-            DIAG_SNAP.lock().unwrap().push((self.shard_id as u8, t.duration_since(diag_epoch()).as_micros() as u64, ph));
-        }
+        timer.lap(6);
+        timer.finish(self.shard_id);
         self.snapshot_seq = seq;
         self.since_snapshot = 0;
         Ok(())

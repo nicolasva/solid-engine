@@ -26,3 +26,14 @@ default = ["split-done"]
 dense-done = ["solid-engine-core/dense-done"]
 slot64 = ["solid-engine-core/slot64"]
 split-done = ["solid-engine-core/split-done"]
+# Désactivées par défaut (validation et campagnes de mesure uniquement) ; elles activent la feature du même nom du stockage.
+snapshot-fault-injection = ["solid-engine-storage/snapshot-fault-injection"]
+wal-diagnostics = ["solid-engine-storage/wal-diagnostics"]
+
+[[test]]
+name = "snapshot_worker_faults"
+required-features = ["snapshot-fault-injection"]
+
+[[test]]
+name = "kill_audit_load"
+required-features = ["snapshot-fault-injection", "wal-diagnostics"]
